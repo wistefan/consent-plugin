@@ -16,22 +16,22 @@ func TestConsentFilter_ParseConf(t *testing.T) {
 	tests := []struct {
 		name    string
 		input   []byte
-		wantNil bool
+		wantErr bool
 	}{
 		{
-			name:    "empty JSON object",
+			name:    "valid config returns parsed Config",
+			input:   []byte(`{"consent_api_url": "https://consent.example.com"}`),
+			wantErr: false,
+		},
+		{
+			name:    "missing required field returns error",
 			input:   []byte(`{}`),
-			wantNil: false,
+			wantErr: true,
 		},
 		{
-			name:    "arbitrary JSON",
-			input:   []byte(`{"key": "value"}`),
-			wantNil: false,
-		},
-		{
-			name:    "nil input returns nil conf without error",
+			name:    "nil input returns error",
 			input:   nil,
-			wantNil: true,
+			wantErr: true,
 		},
 	}
 
@@ -39,11 +39,14 @@ func TestConsentFilter_ParseConf(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			p := &ConsentFilter{}
 			conf, err := p.ParseConf(tt.input)
-			require.NoError(t, err)
-			if tt.wantNil {
+			if tt.wantErr {
+				require.Error(t, err)
 				assert.Nil(t, conf)
 			} else {
+				require.NoError(t, err)
 				assert.NotNil(t, conf)
+				_, ok := conf.(*Config)
+				assert.True(t, ok, "ParseConf should return *Config type")
 			}
 		})
 	}
