@@ -1,0 +1,75 @@
+# golangci-lint configuration for consent-plugin.
+# Run with: make lint
+
+version: "2"
+
+run:
+  # Timeout for the entire linting process.
+  timeout: 5m
+
+formatters:
+  enable:
+    - gofumpt
+
+linters:
+  default: standard
+  enable:
+    - bodyclose
+    - errname
+    - errorlint
+    - goconst
+    - gocritic
+    - gosec
+    - mirror
+    - misspell
+    - noctx
+    - predeclared
+    - revive
+    - unconvert
+    - unparam
+    - whitespace
+
+  settings:
+    goconst:
+      # Minimum occurrences before suggesting a constant.
+      min-occurrences: 3
+
+    revive:
+      rules:
+        - name: exported
+          arguments:
+            - "checkPrivateReceivers"
+
+    gosec:
+      excludes:
+        # Permit potential HTTP request made with variable URL — required
+        # for the consent API client whose URL is configuration-driven.
+        - G107
+        # Permit test JWT strings that look like hardcoded credentials.
+        - G101
+        # Permit unhandled errors in test helpers (e.g., json.Encode to
+        # ResponseWriter) where failure is not the test's concern.
+        - G104
+
+  exclusions:
+    # Do not flag repeated string literals in test files — test data
+    # naturally repeats values and extracting constants harms readability.
+    rules:
+      - linters:
+          - goconst
+        path: _test\.go
+      # Do not require error checks on writes/encodes in test helpers.
+      - linters:
+          - errcheck
+        path: _test\.go
+      # Allow stuttering type names in the consent package — renaming
+      # ConsentRequest/ConsentResponse to Request/Response would be
+      # ambiguous when imported alongside other domain packages.
+      - linters:
+          - revive
+        path: internal/consent/models\.go
+        text: "stutters"
+
+issues:
+  exclude-dirs:
+    - vendor

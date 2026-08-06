@@ -77,7 +77,7 @@ func (c *Client) CheckConsent(ctx context.Context, req ConsentRequest) (*Consent
 	if err != nil {
 		return nil, fmt.Errorf("consent client: HTTP request failed: %w", err)
 	}
-	defer httpResp.Body.Close()
+	defer func() { _ = httpResp.Body.Close() }()
 
 	respBody, err := io.ReadAll(httpResp.Body)
 	if err != nil {

@@ -3,6 +3,9 @@
 package plugin
 
 import (
+	"consent-plugin/internal/consent"
+	"consent-plugin/internal/filter"
+	"consent-plugin/internal/jwt"
 	"context"
 	"log"
 	"net/http"
@@ -10,10 +13,6 @@ import (
 
 	pkgHTTP "github.com/apache/apisix-go-plugin-runner/pkg/http"
 	"github.com/apache/apisix-go-plugin-runner/pkg/plugin"
-
-	"consent-plugin/internal/consent"
-	"consent-plugin/internal/filter"
-	"consent-plugin/internal/jwt"
 )
 
 // pluginName is the registered name for this plugin in APISIX configuration.

@@ -4,10 +4,10 @@
 package main
 
 import (
-	"github.com/apache/apisix-go-plugin-runner/pkg/runner"
-
-	// Import the plugin package to trigger init() registration.
 	_ "consent-plugin/internal/plugin"
+
+	"github.com/apache/apisix-go-plugin-runner/pkg/runner"
+	// Import the plugin package to trigger init() registration.
 )
 
 func main() {

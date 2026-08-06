@@ -1,6 +1,7 @@
 package plugin
 
 import (
+	"consent-plugin/internal/consent"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -10,8 +11,6 @@ import (
 	pkgHTTP "github.com/apache/apisix-go-plugin-runner/pkg/http"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-
-	"consent-plugin/internal/consent"
 )
 
 func TestConsentFilter_Name(t *testing.T) {
@@ -527,11 +526,12 @@ func TestConsentFilter_ResponseFilter(t *testing.T) {
 
 			// Create config.
 			var cfg interface{}
-			if tt.name == "invalid config type passes through" {
+			switch {
+			case tt.name == "invalid config type passes through":
 				cfg = "not-a-config"
-			} else if tt.configFn != nil {
+			case tt.configFn != nil:
 				cfg = tt.configFn(server.URL)
-			} else {
+			default:
 				cfg = newTestConfig(server.URL)
 			}
 
