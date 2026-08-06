@@ -1,6 +1,6 @@
 module consent-plugin
 
-go 1.21
+go 1.26
 
 require (
 	github.com/apache/apisix-go-plugin-runner v0.5.0
