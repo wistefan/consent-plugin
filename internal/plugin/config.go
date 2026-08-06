@@ -69,6 +69,21 @@ type Config struct {
 	// DenyResponseContentType is the Content-Type header for denial responses.
 	// Defaults to DefaultDenyResponseContentType ("application/json").
 	DenyResponseContentType string `json:"deny_response_content_type,omitempty"`
+
+	// FailOpen controls the behavior when the consent API is unavailable or
+	// returns an error. When nil or true (default), responses pass through
+	// on consent API errors (fail-open). When false, responses are denied
+	// on consent API errors (fail-closed).
+	FailOpen *bool `json:"fail_open,omitempty"`
+}
+
+// IsFailOpen returns whether the plugin should fail-open when the consent API
+// is unavailable. Returns true (fail-open) by default when FailOpen is nil.
+func (c *Config) IsFailOpen() bool {
+	if c.FailOpen == nil {
+		return true
+	}
+	return *c.FailOpen
 }
 
 // applyDefaults sets default values for optional fields that were not provided
