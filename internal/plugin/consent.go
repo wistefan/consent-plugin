@@ -34,8 +34,7 @@ func (c *ConsentFilter) Name() string {
 // the JSON bytes provided by APISIX. Returns the parsed configuration
 // or an error if the configuration is invalid.
 func (c *ConsentFilter) ParseConf(in []byte) (interface{}, error) {
-	// TODO: implement configuration parsing in Step 2
-	return in, nil
+	return ParseConfig(in)
 }
 
 // RequestFilter intercepts incoming HTTP requests to capture request context
