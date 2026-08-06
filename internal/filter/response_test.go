@@ -172,9 +172,9 @@ func TestRemoveFields(t *testing.T) {
 			},
 		},
 		{
-			name:   "empty denied fields list returns body unchanged",
-			body:   []byte(`{"name":"Alice","age":30}`),
-			fields: []string{},
+			name:    "empty denied fields list returns body unchanged",
+			body:    []byte(`{"name":"Alice","age":30}`),
+			fields:  []string{},
 			wantRaw: []byte(`{"name":"Alice","age":30}`),
 		},
 		{
@@ -208,9 +208,9 @@ func TestRemoveFields(t *testing.T) {
 			wantRaw: nil,
 		},
 		{
-			name:   "remove all fields leaves empty object",
-			body:   []byte(`{"name":"Alice","age":30}`),
-			fields: []string{"name", "age"},
+			name:       "remove all fields leaves empty object",
+			body:       []byte(`{"name":"Alice","age":30}`),
+			fields:     []string{"name", "age"},
 			wantResult: map[string]interface{}{},
 		},
 	}

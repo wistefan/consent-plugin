@@ -16,11 +16,11 @@ import (
 // TestNewClient verifies the constructor applies defaults and configures timeout.
 func TestNewClient(t *testing.T) {
 	tests := []struct {
-		name            string
-		baseURL         string
-		timeoutMs       int
-		wantTimeout     time.Duration
-		wantBaseURL     string
+		name        string
+		baseURL     string
+		timeoutMs   int
+		wantTimeout time.Duration
+		wantBaseURL string
 	}{
 		{
 			name:        "valid timeout",

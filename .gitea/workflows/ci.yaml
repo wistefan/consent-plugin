@@ -1,0 +1,36 @@
+# CI pipeline for consent-plugin.
+# Runs on every push and pull request: lint, test with coverage, and build.
+
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - "ticket-*/work"
+  pull_request:
+
+jobs:
+  lint-test-build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Install golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: v2.1.6
+          args: ./...
+
+      - name: Run tests with coverage
+        run: make test-cover
+
+      - name: Build binary
+        run: make build
