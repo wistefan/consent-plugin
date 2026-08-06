@@ -1,0 +1,41 @@
+# Local development environment for APISIX with the consent-filter plugin runner.
+#
+# Usage:
+#   docker compose up --build
+#
+# This starts APISIX with etcd and the Go plugin runner sidecar.
+
+version: "3.8"
+
+services:
+  etcd:
+    image: bitnami/etcd:3.5
+    environment:
+      ETCD_ENABLE_V2: "true"
+      ALLOW_NONE_AUTHENTICATION: "yes"
+      ETCD_ADVERTISE_CLIENT_URLS: "http://etcd:2379"
+      ETCD_LISTEN_CLIENT_URLS: "http://0.0.0.0:2379"
+    ports:
+      - "2379:2379"
+
+  apisix:
+    image: apache/apisix:3.8.0-debian
+    depends_on:
+      - etcd
+    ports:
+      - "9080:9080"   # HTTP proxy port
+      - "9180:9180"   # Admin API port
+    volumes:
+      - ./apisix-config.yaml:/usr/local/apisix/conf/config.yaml:ro
+      - /tmp/runner.sock:/tmp/runner.sock
+    restart: on-failure
+
+  plugin-runner:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - /tmp/runner.sock:/tmp/runner.sock
+    environment:
+      APISIX_LISTEN_ADDRESS: "unix:/tmp/runner.sock"
+    restart: on-failure
