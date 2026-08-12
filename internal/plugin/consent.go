@@ -3,13 +3,13 @@
 package plugin
 
 import (
+	"consent-plugin/internal/audit"
 	"consent-plugin/internal/consent"
-	"consent-plugin/internal/filter"
 	"consent-plugin/internal/jwt"
 	"context"
 	"log"
 	"net/http"
-	"strings"
+	"time"
 
 	pkgHTTP "github.com/apache/apisix-go-plugin-runner/pkg/http"
 	"github.com/apache/apisix-go-plugin-runner/pkg/plugin"
@@ -18,11 +18,33 @@ import (
 // pluginName is the registered name for this plugin in APISIX configuration.
 const pluginName = "consent-filter"
 
-// jsonContentTypePrefix is the Content-Type value prefix that identifies JSON responses.
-const jsonContentTypePrefix = "application/json"
-
 // jwtSubjectClaim is the JWT claim key used to extract the subject identity.
 const jwtSubjectClaim = "sub"
+
+// nginxRequestIDVar is the Nginx variable ($request_id) holding a unique id
+// per HTTP request. Unlike the runner's per-RPC ID(), it is identical in the
+// RequestFilter (ext-plugin-pre-req) and ResponseFilter (ext-plugin-post-resp)
+// phases, so it is used to correlate the context captured in one phase with
+// the other.
+const nginxRequestIDVar = "request_id"
+
+// varReader is the subset of the runner's Request/Response interfaces that
+// exposes Nginx variables. Both pkgHTTP.Request and pkgHTTP.Response satisfy it.
+type varReader interface {
+	Var(name string) ([]byte, error)
+}
+
+// correlationKey returns a key that stably identifies the HTTP request across
+// the request and response phases, based on the Nginx $request_id variable.
+// It returns false if the variable cannot be read, in which case the two
+// phases cannot be correlated.
+func correlationKey(v varReader) (string, bool) {
+	id, err := v.Var(nginxRequestIDVar)
+	if err != nil || len(id) == 0 {
+		return "", false
+	}
+	return string(id), true
+}
 
 func init() {
 	if err := plugin.RegisterPlugin(&ConsentFilter{}); err != nil {
@@ -92,20 +114,50 @@ func (c *ConsentFilter) RequestFilter(conf interface{}, w http.ResponseWriter, r
 		}
 	}
 
-	StoreRequestContext(r.ID(), reqCtx)
+	// Correlate with the response phase via the stable Nginx $request_id, not
+	// the runner's per-RPC ID() (which differs between pre-req and post-resp).
+	key, ok := correlationKey(r)
+	if !ok {
+		log.Printf("[consent-filter] RequestFilter: could not read %q for request %d; consent context not stored",
+			nginxRequestIDVar, r.ID())
+		return
+	}
+
+	StoreRequestContext(key, reqCtx)
 }
 
-// ResponseFilter intercepts upstream HTTP responses, consults the consent API,
-// and applies filtering or denial based on the consent decision.
+// decisionAllow and decisionDeny are the audit-facing labels for the decision.
+const (
+	decisionAllow = "allow"
+	decisionDeny  = "deny"
+)
+
+// responseOutcome is the result of evaluating consent for one response: the
+// decision to enforce plus the fields needed to record it in the audit log.
+type responseOutcome struct {
+	decision  string // decisionAllow | decisionDeny
+	reason    string
+	requestID string
+	subject   string
+	resource  string
+	method    string
+}
+
+// ResponseFilter gates the upstream response on the data subject's consent.
 //
 // The flow is:
-//  1. Load and delete the stored RequestContext (cleanup to prevent memory leaks).
-//  2. Read the upstream response body; pass through if empty or non-JSON.
-//  3. Extract top-level field names from the JSON body.
-//  4. Build a ConsentRequest and call the consent API.
-//  5. Apply the consent decision: allow (pass through), deny (error response),
-//     or filter (remove denied fields from the body).
-//  6. On consent API errors, apply fail-open or fail-closed policy.
+//  1. Correlate with the request phase and load (and delete) the stored context.
+//  2. Build a ConsentRequest (the subject comes from the JWT "sub" claim).
+//  3. Run the two-call consent check against the consent-manager.
+//  4. Allow → pass the response through unchanged; deny → replace it with the
+//     configured denial response.
+//  5. On unresolved context or a consent-manager error, apply the fail policy
+//     (deny unless explicitly fail-open).
+//
+// Every decision is recorded to the audit sink (when enabled) before it is
+// enforced. The check is a coarse allow/deny on the subject's consent and is
+// independent of the response body, so — unlike a field-level filter — an empty
+// or non-JSON personal-data response is still gated rather than passed through.
 func (c *ConsentFilter) ResponseFilter(conf interface{}, w pkgHTTP.Response) {
 	cfg, ok := conf.(*Config)
 	if !ok {
@@ -113,81 +165,113 @@ func (c *ConsentFilter) ResponseFilter(conf interface{}, w pkgHTTP.Response) {
 		return
 	}
 
-	// Load and delete stored request context (cleanup to prevent memory leaks).
-	reqCtx, found := LoadAndDeleteRequestContext(w.ID())
-	if !found {
-		log.Printf("[consent-filter] ResponseFilter: no request context found for request %d, passing through", w.ID())
-		return
-	}
-
-	// Read the upstream response body.
-	body, err := w.ReadBody()
-	if err != nil {
-		log.Printf("[consent-filter] ResponseFilter: failed to read body for request %d: %v", w.ID(), err)
-		return
-	}
-
-	// If body is empty, pass through.
-	if len(body) == 0 {
-		return
-	}
-
-	// Check if response Content-Type is JSON; pass through non-JSON responses.
-	contentType := w.Header().Get("Content-Type")
-	if !isJSONContentType(contentType) {
-		return
-	}
-
-	// Extract top-level field names from the response body.
-	fieldNames, err := filter.ExtractFieldNames(body)
-	if err != nil {
-		log.Printf("[consent-filter] ResponseFilter: failed to extract field names for request %d: %v", w.ID(), err)
-		// Proceed with empty field names — the consent API can still make a decision.
-	}
-
-	// Build the consent request from stored context and response fields.
-	consentReq := buildConsentRequest(reqCtx, fieldNames)
-
-	// Create consent client and check consent.
-	consentClient := consent.NewClient(cfg.ConsentAPIURL, cfg.ConsentAPITimeout)
-	consentResp, err := consentClient.CheckConsent(context.Background(), consentReq)
-	if err != nil {
-		log.Printf("[consent-filter] ResponseFilter: consent API error for request %d: %v", w.ID(), err)
-		if !cfg.IsFailOpen() {
-			denyResponse(w, cfg)
-		}
-		return
-	}
-
-	// Apply the consent decision.
-	switch consentResp.Decision {
-	case consent.DecisionAllow:
-		// Pass through unchanged.
-		return
-
-	case consent.DecisionDeny:
+	outcome := c.evaluate(cfg, w)
+	recordAudit(cfg, outcome)
+	if outcome.decision == decisionDeny {
 		denyResponse(w, cfg)
-
-	case consent.DecisionFilter:
-		filteredBody, err := filter.RemoveFields(body, consentResp.DeniedFields)
-		if err != nil {
-			log.Printf("[consent-filter] ResponseFilter: failed to filter response for request %d: %v", w.ID(), err)
-			return
-		}
-		if _, err := w.Write(filteredBody); err != nil {
-			log.Printf("[consent-filter] ResponseFilter: failed to write filtered body for request %d: %v", w.ID(), err)
-		}
 	}
 }
 
-// buildConsentRequest creates a ConsentRequest from the stored request
-// context and the extracted response field names.
-func buildConsentRequest(reqCtx *RequestContext, fieldNames []string) consent.ConsentRequest {
+// evaluate runs the consent decision for the current response and returns the
+// outcome to enforce; it does not write the response. A missing correlation id,
+// missing request context, or a consent-manager error falls back to the fail
+// policy (deny unless explicitly fail-open).
+func (c *ConsentFilter) evaluate(cfg *Config, w pkgHTTP.Response) responseOutcome {
+	// Correlate with the request phase via the stable Nginx $request_id.
+	key, ok := correlationKey(w)
+	if !ok {
+		log.Printf("[consent-filter] ResponseFilter: could not read %q for request %d; cannot verify consent", nginxRequestIDVar, w.ID())
+		return failOutcome(cfg, "no request correlation id", "", nil)
+	}
+
+	// Load and delete stored request context (cleanup to prevent memory leaks).
+	reqCtx, found := LoadAndDeleteRequestContext(key)
+	if !found {
+		// The request phase did not capture context for this request; the
+		// consent decision cannot be made, so honor the fail policy instead
+		// of silently passing the response through.
+		log.Printf("[consent-filter] ResponseFilter: no request context found for request %s; cannot verify consent", key)
+		return failOutcome(cfg, "no request context", key, nil)
+	}
+
+	// Run the two-call consent check for the request subject.
+	consentReq := buildConsentRequest(reqCtx)
+	consentClient := consent.NewClient(consent.ClientConfig{
+		BaseURL:          cfg.ConsentAPIURL,
+		APIPrefix:        cfg.ConsentAPIPrefix,
+		ConsentKey:       cfg.ConsentKey,
+		ProviderSD:       cfg.ProviderSD,
+		ParticipantToken: cfg.ParticipantToken,
+		ClientID:         cfg.ClientID,
+		ClientSecret:     cfg.ClientSecret,
+		TokenTTL:         time.Duration(cfg.ParticipantTokenTTL) * time.Second,
+		TimeoutMs:        cfg.ConsentAPITimeout,
+	})
+	consentResp, err := consentClient.CheckConsent(context.Background(), consentReq)
+	if err != nil {
+		log.Printf("[consent-filter] ResponseFilter: consent check error for request %d: %v", w.ID(), err)
+		return failOutcome(cfg, "consent check error: "+err.Error(), key, &consentReq)
+	}
+
+	decision := decisionDeny
+	if consentResp.Decision == consent.DecisionAllow {
+		decision = decisionAllow
+	}
+	return responseOutcome{
+		decision:  decision,
+		reason:    consentResp.Reason,
+		requestID: key,
+		subject:   consentReq.Subject,
+		resource:  consentReq.Resource,
+		method:    consentReq.Method,
+	}
+}
+
+// failOutcome builds the outcome for an unresolved consent check, applying the
+// fail policy (allow when fail-open, otherwise deny). req may be nil when no
+// request context was captured.
+func failOutcome(cfg *Config, reason, requestID string, req *consent.ConsentRequest) responseOutcome {
+	decision := decisionDeny
+	if cfg.IsFailOpen() {
+		decision = decisionAllow
+	}
+	o := responseOutcome{decision: decision, reason: reason, requestID: requestID}
+	if req != nil {
+		o.subject = req.Subject
+		o.resource = req.Resource
+		o.method = req.Method
+	}
+	return o
+}
+
+// recordAudit emits the decision to the audit sink when auditing is enabled.
+// The emit is asynchronous and best-effort, so it never affects the decision.
+func recordAudit(cfg *Config, outcome responseOutcome) {
+	if !cfg.AuditEnabled {
+		return
+	}
+	audit.Get(audit.Config{
+		Endpoint:    cfg.AuditOTLPEndpoint,
+		ServiceName: cfg.AuditServiceName,
+		Timeout:     time.Duration(cfg.ConsentAPITimeout) * time.Millisecond,
+	}).Emit(audit.Event{
+		Time:      time.Now(),
+		RequestID: outcome.requestID,
+		Subject:   outcome.subject,
+		Resource:  outcome.resource,
+		Method:    outcome.method,
+		Decision:  outcome.decision,
+		Reason:    outcome.reason,
+	})
+}
+
+// buildConsentRequest creates a ConsentRequest from the stored request context.
+// The subject (used to look up consent) is taken from the JWT "sub" claim.
+func buildConsentRequest(reqCtx *RequestContext) consent.ConsentRequest {
 	consentReq := consent.ConsentRequest{
-		Resource:       reqCtx.Path,
-		Method:         reqCtx.Method,
-		Claims:         reqCtx.JWTClaims,
-		ResponseFields: fieldNames,
+		Resource: reqCtx.Path,
+		Method:   reqCtx.Method,
+		Claims:   reqCtx.JWTClaims,
 	}
 
 	// Extract subject from JWT claims if available.
@@ -210,10 +294,4 @@ func denyResponse(w pkgHTTP.Response, cfg *Config) {
 	if _, err := w.Write([]byte(cfg.DenyResponseBody)); err != nil {
 		log.Printf("[consent-filter] ResponseFilter: failed to write deny body for request %d: %v", w.ID(), err)
 	}
-}
-
-// isJSONContentType reports whether the given Content-Type header value
-// indicates a JSON response body.
-func isJSONContentType(contentType string) bool {
-	return strings.Contains(strings.ToLower(contentType), jsonContentTypePrefix)
 }

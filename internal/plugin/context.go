@@ -24,23 +24,28 @@ type RequestContext struct {
 	JWTClaims map[string]interface{}
 }
 
-// requestContextStore is a package-level concurrent-safe store that maps
-// request IDs (uint32) to their captured RequestContext. This bridges the
-// RequestFilter and ResponseFilter phases, which are called separately by
-// the APISIX plugin runner.
+// requestContextStore is a package-level concurrent-safe store that maps a
+// stable per-request key to its captured RequestContext. This bridges the
+// RequestFilter and ResponseFilter phases, which APISIX invokes as two
+// separate RPC calls (ext-plugin-pre-req and ext-plugin-post-resp).
+//
+// The key MUST be stable across those two phases for the same HTTP request.
+// The runner's per-RPC id (Request.ID()/Response.ID()) is NOT stable between
+// them, so the Nginx `$request_id` variable is used instead (see
+// correlationKey in consent.go).
 var requestContextStore sync.Map
 
-// StoreRequestContext saves a RequestContext for the given request ID.
-// It overwrites any previously stored context for the same ID.
-func StoreRequestContext(requestID uint32, ctx *RequestContext) {
-	requestContextStore.Store(requestID, ctx)
+// StoreRequestContext saves a RequestContext for the given request key.
+// It overwrites any previously stored context for the same key.
+func StoreRequestContext(requestKey string, ctx *RequestContext) {
+	requestContextStore.Store(requestKey, ctx)
 }
 
 // LoadRequestContext retrieves the stored RequestContext for the given
-// request ID. Returns the context and true if found, or nil and false
-// if no context exists for that ID.
-func LoadRequestContext(requestID uint32) (*RequestContext, bool) {
-	val, ok := requestContextStore.Load(requestID)
+// request key. Returns the context and true if found, or nil and false
+// if no context exists for that key.
+func LoadRequestContext(requestKey string) (*RequestContext, bool) {
+	val, ok := requestContextStore.Load(requestKey)
 	if !ok {
 		return nil, false
 	}
@@ -54,18 +59,18 @@ func LoadRequestContext(requestID uint32) (*RequestContext, bool) {
 }
 
 // DeleteRequestContext removes the stored RequestContext for the given
-// request ID. This should be called after the context has been consumed
+// request key. This should be called after the context has been consumed
 // during ResponseFilter to prevent memory leaks.
-func DeleteRequestContext(requestID uint32) {
-	requestContextStore.Delete(requestID)
+func DeleteRequestContext(requestKey string) {
+	requestContextStore.Delete(requestKey)
 }
 
 // LoadAndDeleteRequestContext atomically loads and removes the stored
-// RequestContext for the given request ID. This is the preferred method
+// RequestContext for the given request key. This is the preferred method
 // for consuming context during ResponseFilter as it combines retrieval
 // and cleanup in a single operation.
-func LoadAndDeleteRequestContext(requestID uint32) (*RequestContext, bool) {
-	val, ok := requestContextStore.LoadAndDelete(requestID)
+func LoadAndDeleteRequestContext(requestKey string) (*RequestContext, bool) {
+	val, ok := requestContextStore.LoadAndDelete(requestKey)
 	if !ok {
 		return nil, false
 	}

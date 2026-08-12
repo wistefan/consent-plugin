@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"os"
 )
 
 // Default values for optional configuration fields.
@@ -16,6 +17,10 @@ const (
 
 	// DefaultJWTHeaderName is the default HTTP header containing the JWT token.
 	DefaultJWTHeaderName = "Authorization"
+
+	// DefaultConsentAPIPrefix is the default consent-manager API prefix,
+	// prepended to every endpoint path (matches the consent-manager's API_PREFIX).
+	DefaultConsentAPIPrefix = "/v1"
 
 	// DefaultDenyStatusCode is the default HTTP status code returned when consent is denied.
 	DefaultDenyStatusCode = 403
@@ -39,6 +44,26 @@ const (
 	MaxHTTPStatusCode = 599
 )
 
+// Environment variables that provide the participant credentials and consent
+// key out-of-band, so they need not live in the route config (plaintext in
+// etcd). A value set in the route config always takes precedence; the env var
+// is only consulted when the corresponding field is empty. The plugin runner
+// inherits these from the APISIX container, which sources them from a Secret.
+const (
+	// EnvConsentKey supplies ConsentKey (x-visionstrust-consent-key).
+	EnvConsentKey = "CONSENT_KEY"
+
+	// EnvClientID supplies ClientID (participant client-credentials login).
+	EnvClientID = "CONSENT_CLIENT_ID"
+
+	// EnvClientSecret supplies ClientSecret (participant client-credentials login).
+	EnvClientSecret = "CONSENT_CLIENT_SECRET"
+
+	// EnvAuditOTLPEndpoint supplies AuditOTLPEndpoint (the OTLP/HTTP Collector
+	// endpoint access-decision audit events are exported to).
+	EnvAuditOTLPEndpoint = "CONSENT_AUDIT_OTLP_ENDPOINT"
+)
+
 // Config holds the plugin configuration that APISIX passes as JSON.
 // It defines how the consent-filter plugin connects to the external consent API
 // and how it handles denial responses.
@@ -55,8 +80,43 @@ type Config struct {
 	JWTHeaderName string `json:"jwt_header_name,omitempty"`
 
 	// JWTClaimsToForward specifies which JWT claims to send to the consent API.
-	// For example: ["sub", "scope"].
+	// For example: ["sub", "scope"]. Must include "sub" — the consent check
+	// resolves the data subject from the "sub" claim.
 	JWTClaimsToForward []string `json:"jwt_claims_to_forward,omitempty"`
+
+	// ConsentAPIPrefix is the consent-manager API prefix prepended to endpoint
+	// paths. Defaults to DefaultConsentAPIPrefix ("/v1").
+	ConsentAPIPrefix string `json:"consent_api_prefix,omitempty"`
+
+	// ConsentKey is the shared secret sent as the x-visionstrust-consent-key
+	// header on the identifier-search call. Optional: when the plugin runs
+	// behind the authority's facade, the facade injects the key server-side and
+	// this is not needed. Falls back to the EnvConsentKey env var when empty.
+	ConsentKey string `json:"consent_key,omitempty"`
+
+	// ClientID / ClientSecret are the participant client credentials. When set,
+	// the plugin obtains (and refreshes) a participant token via
+	// /participants/login, and — when ProviderSD is empty — derives the provider
+	// self-description from /participants/me. Preferred over a static
+	// ParticipantToken, as these are stable while the token expires. Each falls
+	// back to its env var (EnvClientID / EnvClientSecret) when empty, so the
+	// secret need not sit in the route config.
+	ClientID     string `json:"client_id,omitempty"`
+	ClientSecret string `json:"client_secret,omitempty"`
+
+	// ParticipantTokenTTL caps, in seconds, how long a client-credentials token
+	// is cached before re-login (defaults to 3000s). Ignored for a static token.
+	ParticipantTokenTTL int `json:"participant_token_ttl,omitempty"`
+
+	// ParticipantToken is an optional *static* participant JWT for the
+	// consents-lookup call. Legacy/override: prefer ClientID/ClientSecret so the
+	// token is fetched and refreshed automatically.
+	ParticipantToken string `json:"participant_token,omitempty"`
+
+	// ProviderSD is the provider self-description URL sent on the
+	// identifier-search call. Optional: when empty it is derived from
+	// /participants/me using the participant token.
+	ProviderSD string `json:"provider_sd,omitempty"`
 
 	// DenyStatusCode is the HTTP status code returned when consent is denied.
 	// Defaults to DefaultDenyStatusCode (403).
@@ -75,6 +135,22 @@ type Config struct {
 	// on consent API errors (fail-open). When false, responses are denied
 	// on consent API errors (fail-closed).
 	FailOpen *bool `json:"fail_open,omitempty"`
+
+	// AuditEnabled turns on emitting an access-decision audit event to an
+	// OpenTelemetry Collector (as an OTLP/HTTP log record) for every consent
+	// decision. Emission is asynchronous and best-effort, so it never blocks or
+	// changes the access decision.
+	AuditEnabled bool `json:"audit_enabled,omitempty"`
+
+	// AuditOTLPEndpoint is the base OTLP/HTTP endpoint of the Collector
+	// (e.g. http://otel-collector:4318); "/v1/logs" is appended. Required when
+	// AuditEnabled. Falls back to the EnvAuditOTLPEndpoint env var when empty.
+	AuditOTLPEndpoint string `json:"audit_otlp_endpoint,omitempty"`
+
+	// AuditServiceName is the resource service.name stamped on audit records -
+	// the marker the Collector routes on to keep audit logs separate from traces.
+	// Empty defaults to the audit package's DefaultServiceName.
+	AuditServiceName string `json:"audit_service_name,omitempty"`
 }
 
 // IsFailOpen returns whether the plugin should fail-open when the consent API
@@ -95,6 +171,9 @@ func (c *Config) applyDefaults() {
 	if c.JWTHeaderName == "" {
 		c.JWTHeaderName = DefaultJWTHeaderName
 	}
+	if c.ConsentAPIPrefix == "" {
+		c.ConsentAPIPrefix = DefaultConsentAPIPrefix
+	}
 	if c.DenyStatusCode == 0 {
 		c.DenyStatusCode = DefaultDenyStatusCode
 	}
@@ -103,6 +182,26 @@ func (c *Config) applyDefaults() {
 	}
 	if c.DenyResponseContentType == "" {
 		c.DenyResponseContentType = DefaultDenyResponseContentType
+	}
+}
+
+// applyEnv fills the credential fields from environment variables when they are
+// not set in the route config. This keeps the consent key and the participant
+// client secret out of the APISIX route config (and thus out of etcd): they are
+// delivered to the plugin runner via the APISIX container's env, sourced from a
+// Kubernetes Secret. A value present in the config always wins.
+func (c *Config) applyEnv() {
+	if c.ConsentKey == "" {
+		c.ConsentKey = os.Getenv(EnvConsentKey)
+	}
+	if c.ClientID == "" {
+		c.ClientID = os.Getenv(EnvClientID)
+	}
+	if c.ClientSecret == "" {
+		c.ClientSecret = os.Getenv(EnvClientSecret)
+	}
+	if c.AuditOTLPEndpoint == "" {
+		c.AuditOTLPEndpoint = os.Getenv(EnvAuditOTLPEndpoint)
 	}
 }
 
@@ -131,6 +230,10 @@ func (c *Config) Validate() error {
 			MinHTTPStatusCode, MaxHTTPStatusCode, c.DenyStatusCode)
 	}
 
+	if c.AuditEnabled && c.AuditOTLPEndpoint == "" {
+		return errors.New("config validation: audit_otlp_endpoint is required when audit_enabled is true")
+	}
+
 	return nil
 }
 
@@ -147,6 +250,7 @@ func ParseConfig(in []byte) (*Config, error) {
 	}
 
 	conf.applyDefaults()
+	conf.applyEnv()
 
 	if err := conf.Validate(); err != nil {
 		return nil, err

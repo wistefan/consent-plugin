@@ -61,9 +61,9 @@ func TestStoreAndLoadRequestContext(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			StoreRequestContext(tt.requestID, tt.ctx)
+			StoreRequestContext(testReqKey(tt.requestID), tt.ctx)
 
-			loaded, ok := LoadRequestContext(tt.requestID)
+			loaded, ok := LoadRequestContext(testReqKey(tt.requestID))
 			require.True(t, ok, "expected context to be found")
 			assert.Equal(t, tt.ctx, loaded)
 		})
@@ -75,7 +75,7 @@ func TestLoadRequestContext_NotFound(t *testing.T) {
 	defer clearContextStore()
 
 	const nonExistentID uint32 = 99999
-	loaded, ok := LoadRequestContext(nonExistentID)
+	loaded, ok := LoadRequestContext(testReqKey(nonExistentID))
 	assert.False(t, ok, "expected context not to be found")
 	assert.Nil(t, loaded)
 }
@@ -90,18 +90,18 @@ func TestDeleteRequestContext(t *testing.T) {
 		Path:   "/api/test",
 	}
 
-	StoreRequestContext(requestID, ctx)
+	StoreRequestContext(testReqKey(requestID), ctx)
 
 	// Verify it's stored.
-	loaded, ok := LoadRequestContext(requestID)
+	loaded, ok := LoadRequestContext(testReqKey(requestID))
 	require.True(t, ok)
 	assert.Equal(t, ctx, loaded)
 
 	// Delete it.
-	DeleteRequestContext(requestID)
+	DeleteRequestContext(testReqKey(requestID))
 
 	// Verify it's gone.
-	loaded, ok = LoadRequestContext(requestID)
+	loaded, ok = LoadRequestContext(testReqKey(requestID))
 	assert.False(t, ok)
 	assert.Nil(t, loaded)
 }
@@ -117,15 +117,15 @@ func TestLoadAndDeleteRequestContext(t *testing.T) {
 		JWTClaims: map[string]interface{}{"sub": "user-20"},
 	}
 
-	StoreRequestContext(requestID, ctx)
+	StoreRequestContext(testReqKey(requestID), ctx)
 
 	// LoadAndDelete should return the context.
-	loaded, ok := LoadAndDeleteRequestContext(requestID)
+	loaded, ok := LoadAndDeleteRequestContext(testReqKey(requestID))
 	require.True(t, ok)
 	assert.Equal(t, ctx, loaded)
 
 	// Subsequent load should fail — already deleted.
-	loaded, ok = LoadRequestContext(requestID)
+	loaded, ok = LoadRequestContext(testReqKey(requestID))
 	assert.False(t, ok)
 	assert.Nil(t, loaded)
 }
@@ -135,7 +135,7 @@ func TestLoadAndDeleteRequestContext_NotFound(t *testing.T) {
 	defer clearContextStore()
 
 	const nonExistentID uint32 = 88888
-	loaded, ok := LoadAndDeleteRequestContext(nonExistentID)
+	loaded, ok := LoadAndDeleteRequestContext(testReqKey(nonExistentID))
 	assert.False(t, ok)
 	assert.Nil(t, loaded)
 }
@@ -154,10 +154,10 @@ func TestStoreRequestContext_OverwritesExisting(t *testing.T) {
 		Path:   "/replacement",
 	}
 
-	StoreRequestContext(requestID, original)
-	StoreRequestContext(requestID, replacement)
+	StoreRequestContext(testReqKey(requestID), original)
+	StoreRequestContext(testReqKey(requestID), replacement)
 
-	loaded, ok := LoadRequestContext(requestID)
+	loaded, ok := LoadRequestContext(testReqKey(requestID))
 	require.True(t, ok)
 	assert.Equal(t, replacement, loaded)
 }
@@ -214,7 +214,7 @@ func TestConcurrentStoreAndLoad(t *testing.T) {
 				Path:      fmt.Sprintf("/api/resource/%d", id),
 				JWTClaims: map[string]interface{}{"sub": fmt.Sprintf("user-%d", id)},
 			}
-			StoreRequestContext(id, ctx)
+			StoreRequestContext(testReqKey(id), ctx)
 		}(i)
 	}
 	wg.Wait()
@@ -224,7 +224,7 @@ func TestConcurrentStoreAndLoad(t *testing.T) {
 		wg.Add(1)
 		go func(id uint32) {
 			defer wg.Done()
-			loaded, ok := LoadRequestContext(id)
+			loaded, ok := LoadRequestContext(testReqKey(id))
 			assert.True(t, ok, "context for ID %d should exist", id)
 			if ok {
 				expectedPath := fmt.Sprintf("/api/resource/%d", id)
@@ -239,14 +239,14 @@ func TestConcurrentStoreAndLoad(t *testing.T) {
 		wg.Add(1)
 		go func(id uint32) {
 			defer wg.Done()
-			DeleteRequestContext(id)
+			DeleteRequestContext(testReqKey(id))
 		}(i)
 	}
 	wg.Wait()
 
 	// Verify all contexts are gone.
 	for i := uint32(0); i < goroutineCount; i++ {
-		_, ok := LoadRequestContext(i)
+		_, ok := LoadRequestContext(testReqKey(i))
 		assert.False(t, ok, "context for ID %d should have been deleted", i)
 	}
 }
@@ -260,7 +260,7 @@ func TestConcurrentLoadAndDelete(t *testing.T) {
 
 	// Pre-populate the store.
 	for i := uint32(0); i < goroutineCount; i++ {
-		StoreRequestContext(i, &RequestContext{
+		StoreRequestContext(testReqKey(i), &RequestContext{
 			Method: "GET",
 			Path:   fmt.Sprintf("/api/%d", i),
 		})
@@ -273,7 +273,7 @@ func TestConcurrentLoadAndDelete(t *testing.T) {
 		wg.Add(1)
 		go func(id uint32) {
 			defer wg.Done()
-			_, ok := LoadAndDeleteRequestContext(id)
+			_, ok := LoadAndDeleteRequestContext(testReqKey(id))
 			results[id] = ok
 		}(i)
 	}
@@ -285,7 +285,7 @@ func TestConcurrentLoadAndDelete(t *testing.T) {
 
 	// Verify everything is deleted.
 	for i := uint32(0); i < goroutineCount; i++ {
-		_, ok := LoadRequestContext(i)
+		_, ok := LoadRequestContext(testReqKey(i))
 		assert.False(t, ok, "context for ID %d should have been deleted", i)
 	}
 }
