@@ -1,0 +1,18 @@
+name: Build
+
+# Reusable compile check: verifies the go-plugin-runner binary builds.
+on:
+  workflow_call:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Compile go-runner
+        run: go build -trimpath -ldflags="-s -w" -o go-runner .

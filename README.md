@@ -150,6 +150,44 @@ consent-plugin/
 │       └── integration_test.go    # End-to-end integration tests
 ```
 
+## CI & Releases
+
+GitHub Actions run the quality gates on every PR and cut releases on merge to
+`main`, following the [FIWARE/VCVerifier](https://github.com/FIWARE/VCVerifier)
+structure. See [.github/workflows/README.md](.github/workflows/README.md) for the
+full pipeline and [CONTRIBUTING.md](CONTRIBUTING.md) for the label-driven
+versioning rules.
+
+Each release publishes:
+
+- a multi-arch (`linux/amd64,arm64`) image
+  `quay.io/wi_stefan/consent-plugin:<version>` (also `:latest`, `:<sha>`), and
+- standalone `go-runner` binaries (`consent-plugin-linux-{amd64,arm64}`) on the
+  GitHub Release.
+
+### Using the release image in APISIX
+
+The image is the primary artifact. In the APISIX deployment an init container
+stages the runner binary out of the image into a shared `ext-plugin` volume, and
+APISIX launches it as the external plugin runner:
+
+```yaml
+initContainers:
+  - name: install-consent-plugin
+    image: quay.io/wi_stefan/consent-plugin:<version>
+    command: ["cp", "/app/go-runner", "/ext-plugin/go-runner"]
+    volumeMounts:
+      - name: ext-plugin-bin
+        mountPath: /ext-plugin
+# ... APISIX then runs: exec /ext-plugin/go-runner
+```
+
+See the reference
+[consent-provider.yaml](https://github.com/FIWARE/data-space-connector/blob/consent-management/k3s/consent-provider.yaml)
+for the complete deployment (secret mounting, env, socket wiring).
+
+Releasing requires the `QUAY_USERNAME` / `QUAY_PASSWORD` repository secrets.
+
 ## License
 
 See [LICENSE](LICENSE) for details.

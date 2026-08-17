@@ -1,0 +1,46 @@
+name: Main
+
+# Merge-to-main pipeline: re-run quality gates, then release. A release is only
+# cut when the merged PR carried a semver label (patch/minor/major); otherwise
+# the release job runs but produces no version. `workflow_dispatch` allows a
+# manual release with an explicit version.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Explicit version to release (e.g. 1.2.3). Leave empty to derive from the last merged PR label."
+        required: false
+        type: string
+        default: ""
+
+concurrency:
+  group: main-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  style-guide:
+    uses: ./.github/workflows/style-guide.yml
+
+  build:
+    uses: ./.github/workflows/build.yml
+
+  tests:
+    uses: ./.github/workflows/tests.yml
+
+  security-analysis:
+    uses: ./.github/workflows/security-analysis.yml
+
+  release:
+    needs:
+      - style-guide
+      - build
+      - tests
+      - security-analysis
+    uses: ./.github/workflows/release.yml
+    with:
+      version: ${{ github.event.inputs.version || '' }}
+    secrets:
+      QUAY_USERNAME: ${{ secrets.QUAY_USERNAME }}
+      QUAY_PASSWORD: ${{ secrets.QUAY_PASSWORD }}
