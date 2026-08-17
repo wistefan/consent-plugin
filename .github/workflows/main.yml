@@ -19,6 +19,14 @@ concurrency:
   group: main-${{ github.ref }}
   cancel-in-progress: false
 
+# Grant the tokens the called reusable workflows need: security-analysis.yml
+# uploads SARIF (security-events: write) and release.yml creates a GitHub
+# release (contents: write). Callers must grant at least what the nested jobs
+# request.
+permissions:
+  contents: write
+  security-events: write
+
 jobs:
   style-guide:
     uses: ./.github/workflows/style-guide.yml
