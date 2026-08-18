@@ -221,7 +221,7 @@ func (e *Emitter) export(batch []Event) {
 		log.Printf("[consent-filter] audit: export to %s failed: %v", e.endpoint, err)
 		return
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode >= http.StatusMultipleChoices {
 		log.Printf("[consent-filter] audit: export to %s returned HTTP %d", e.endpoint, resp.StatusCode)
 	}

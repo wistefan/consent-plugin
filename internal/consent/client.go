@@ -289,13 +289,13 @@ func (c *Client) login(ctx context.Context) (string, error) {
 	}
 	httpReq.Header.Set("Content-Type", ContentTypeJSON)
 
-	resp, body, err := c.do(httpReq)
+	status, body, err := c.do(httpReq)
 	if err != nil {
 		return "", err
 	}
-	if resp.StatusCode != http.StatusOK {
+	if status != http.StatusOK {
 		return "", fmt.Errorf("consent client: participant login returned status %d, body: %s",
-			resp.StatusCode, truncateBody(body))
+			status, truncateBody(body))
 	}
 	var out loginResponse
 	if err := json.Unmarshal(body, &out); err != nil {
@@ -320,16 +320,16 @@ func (c *Client) fetchProviderSD(ctx context.Context, token string) (string, err
 	}
 	httpReq.Header.Set("Authorization", "Bearer "+token)
 
-	resp, body, err := c.do(httpReq)
+	status, body, err := c.do(httpReq)
 	if err != nil {
 		return "", err
 	}
-	if resp.StatusCode == http.StatusUnauthorized {
+	if status == http.StatusUnauthorized {
 		return "", errParticipantUnauthorized
 	}
-	if resp.StatusCode != http.StatusOK {
+	if status != http.StatusOK {
 		return "", fmt.Errorf("consent client: participant lookup (/me) returned status %d, body: %s",
-			resp.StatusCode, truncateBody(body))
+			status, truncateBody(body))
 	}
 	var out meResponse
 	if err := json.Unmarshal(body, &out); err != nil {
@@ -375,20 +375,20 @@ func (c *Client) resolveUserIdentifier(ctx context.Context, subject, providerSD,
 		httpReq.Header.Set("Authorization", "Bearer "+token)
 	}
 
-	resp, body, err := c.do(httpReq)
+	status, body, err := c.do(httpReq)
 	if err != nil {
 		return "", false, err
 	}
-	if resp.StatusCode == http.StatusNotFound {
+	if status == http.StatusNotFound {
 		return "", false, nil
 	}
-	if resp.StatusCode == http.StatusUnauthorized {
+	if status == http.StatusUnauthorized {
 		// a facade in front of the consent-manager rejected the participant token
 		return "", false, errParticipantUnauthorized
 	}
-	if resp.StatusCode != http.StatusOK {
+	if status != http.StatusOK {
 		return "", false, fmt.Errorf("consent client: identifier search returned status %d, body: %s",
-			resp.StatusCode, truncateBody(body))
+			status, truncateBody(body))
 	}
 	var out identifierSearchResponse
 	if err := json.Unmarshal(body, &out); err != nil {
@@ -415,16 +415,16 @@ func (c *Client) hasGrantedConsent(ctx context.Context, token, userIdentifier st
 	}
 	httpReq.Header.Set("Authorization", "Bearer "+token)
 
-	resp, body, err := c.do(httpReq)
+	status, body, err := c.do(httpReq)
 	if err != nil {
 		return false, err
 	}
-	if resp.StatusCode == http.StatusUnauthorized {
+	if status == http.StatusUnauthorized {
 		return false, errParticipantUnauthorized
 	}
-	if resp.StatusCode != http.StatusOK {
+	if status != http.StatusOK {
 		return false, fmt.Errorf("consent client: consents lookup returned status %d, body: %s",
-			resp.StatusCode, truncateBody(body))
+			status, truncateBody(body))
 	}
 	var out participantConsentsResponse
 	if err := json.Unmarshal(body, &out); err != nil {
@@ -443,20 +443,22 @@ func (c *Client) endpoint(path string) string {
 	return strings.TrimRight(c.baseURL, "/") + c.apiPrefix + path
 }
 
-// do executes the request and returns the response together with its fully read
-// body, closing the body before returning.
-func (c *Client) do(httpReq *http.Request) (*http.Response, []byte, error) {
+// do executes the request and returns the response status code together with
+// its fully read body, closing the body before returning. It intentionally does
+// not surface the *http.Response: the body is already consumed and closed, so
+// callers only need the status code and body bytes.
+func (c *Client) do(httpReq *http.Request) (statusCode int, body []byte, err error) {
 	resp, err := c.httpClient.Do(httpReq)
 	if err != nil {
-		return nil, nil, fmt.Errorf("consent client: HTTP request failed: %w", err)
+		return 0, nil, fmt.Errorf("consent client: HTTP request failed: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	body, err := io.ReadAll(resp.Body)
+	body, err = io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, nil, fmt.Errorf("consent client: failed to read response body: %w", err)
+		return 0, nil, fmt.Errorf("consent client: failed to read response body: %w", err)
 	}
-	return resp, body, nil
+	return resp.StatusCode, body, nil
 }
 
 // maxBodyLogLength bounds error-body length in messages.

@@ -210,6 +210,10 @@ func marshalConfig(t *testing.T, cfg map[string]interface{}) []byte {
 	return b
 }
 
+// responseContentTypeJSON is the Content-Type set on simulated upstream
+// responses in the plugin lifecycle helper; personal-data responses are JSON.
+const responseContentTypeJSON = "application/json"
+
 // runPluginCycle simulates the full APISIX plugin lifecycle: ParseConf, RequestFilter,
 // then ResponseFilter. Returns the mock response for assertion.
 func runPluginCycle(
@@ -217,7 +221,6 @@ func runPluginCycle(
 	configJSON []byte,
 	req *mockRequest,
 	responseBody []byte,
-	responseContentType string,
 ) *mockResponse {
 	t.Helper()
 
@@ -234,9 +237,7 @@ func runPluginCycle(
 
 	// Build the mock response with the same request ID.
 	respHeader := newMockResponseHeader()
-	if responseContentType != "" {
-		respHeader.Set("Content-Type", responseContentType)
-	}
+	respHeader.Set("Content-Type", responseContentTypeJSON)
 	resp := &mockResponse{
 		id:     req.id,
 		header: respHeader,
@@ -273,7 +274,7 @@ func TestIntegration_GrantedConsentPassthrough(t *testing.T) {
 	defer srv.Close()
 
 	resp := runPluginCycle(t, marshalConfig(t, baseConfig(srv.URL)),
-		consentRequest(1, "did:key:zAlice"), []byte(`{"email":"alice@example.org"}`), "application/json")
+		consentRequest(1, "did:key:zAlice"), []byte(`{"email":"alice@example.org"}`))
 
 	assert.Nil(t, resp.writtenBody, "granted consent should not modify the response")
 	assert.Equal(t, 0, resp.writtenStatus)
@@ -286,7 +287,7 @@ func TestIntegration_NoGrantedConsentDenied(t *testing.T) {
 	defer srv.Close()
 
 	resp := runPluginCycle(t, marshalConfig(t, baseConfig(srv.URL)),
-		consentRequest(2, "did:key:zAlice"), []byte(`{"email":"alice@example.org"}`), "application/json")
+		consentRequest(2, "did:key:zAlice"), []byte(`{"email":"alice@example.org"}`))
 
 	assert.Equal(t, 403, resp.writtenStatus)
 	assert.Equal(t, defaultDenyBody, string(resp.writtenBody))
@@ -299,7 +300,7 @@ func TestIntegration_UnknownSubjectDenied(t *testing.T) {
 	defer srv.Close()
 
 	resp := runPluginCycle(t, marshalConfig(t, baseConfig(srv.URL)),
-		consentRequest(3, "did:key:zStranger"), []byte(`{"email":"x@example.org"}`), "application/json")
+		consentRequest(3, "did:key:zStranger"), []byte(`{"email":"x@example.org"}`))
 
 	assert.Equal(t, 403, resp.writtenStatus)
 	assert.Equal(t, defaultDenyBody, string(resp.writtenBody))
@@ -316,7 +317,7 @@ func TestIntegration_CustomDenyResponse(t *testing.T) {
 	cfg["deny_response_content_type"] = "application/json"
 
 	resp := runPluginCycle(t, marshalConfig(t, cfg),
-		consentRequest(4, "did:key:zAlice"), []byte(`{"secret":"x"}`), "application/json")
+		consentRequest(4, "did:key:zAlice"), []byte(`{"secret":"x"}`))
 
 	assert.Equal(t, 451, resp.writtenStatus)
 	assert.Equal(t, `{"error":"legally restricted"}`, string(resp.writtenBody))
@@ -335,7 +336,7 @@ func TestIntegration_ConsentManagerError_FailOpen(t *testing.T) {
 	cfg["fail_open"] = true
 
 	resp := runPluginCycle(t, marshalConfig(t, cfg),
-		consentRequest(5, "did:key:zAlice"), []byte(`{"data":"passes"}`), "application/json")
+		consentRequest(5, "did:key:zAlice"), []byte(`{"data":"passes"}`))
 
 	assert.Nil(t, resp.writtenBody, "fail-open should pass through on consent-manager error")
 	assert.Equal(t, 0, resp.writtenStatus)
@@ -353,7 +354,7 @@ func TestIntegration_ConsentManagerError_FailClosed(t *testing.T) {
 	cfg["fail_open"] = false
 
 	resp := runPluginCycle(t, marshalConfig(t, cfg),
-		consentRequest(6, "did:key:zAlice"), []byte(`{"data":"denied"}`), "application/json")
+		consentRequest(6, "did:key:zAlice"), []byte(`{"data":"denied"}`))
 
 	assert.Equal(t, 403, resp.writtenStatus)
 	assert.Equal(t, defaultDenyBody, string(resp.writtenBody))
@@ -366,7 +367,7 @@ func TestIntegration_SubjectForwardedFromJWT(t *testing.T) {
 	defer srv.Close()
 
 	resp := runPluginCycle(t, marshalConfig(t, baseConfig(srv.URL)),
-		consentRequest(7, "did:key:zBob"), []byte(`{"ok":true}`), "application/json")
+		consentRequest(7, "did:key:zBob"), []byte(`{"ok":true}`))
 
 	assert.Nil(t, resp.writtenBody)
 }
@@ -384,7 +385,7 @@ func TestIntegration_CustomJWTHeader(t *testing.T) {
 	h.Set("X-Auth-Token", "Bearer "+buildMockJWT(map[string]interface{}{"sub": "custom-user"}))
 	req := &mockRequest{id: 8, method: "POST", path: []byte("/api/v1/items"), header: h}
 
-	resp := runPluginCycle(t, marshalConfig(t, cfg), req, []byte(`{"created":true}`), "application/json")
+	resp := runPluginCycle(t, marshalConfig(t, cfg), req, []byte(`{"created":true}`))
 
 	assert.Nil(t, resp.writtenBody, "granted consent via custom JWT header should pass through")
 }
@@ -397,7 +398,7 @@ func TestIntegration_ContextCleanupAfterCycle(t *testing.T) {
 
 	const id = uint32(999)
 	_ = runPluginCycle(t, marshalConfig(t, baseConfig(srv.URL)),
-		consentRequest(id, "did:key:zAlice"), []byte(`{"data":"test"}`), "application/json")
+		consentRequest(id, "did:key:zAlice"), []byte(`{"data":"test"}`))
 
 	_, found := plugin.LoadRequestContext(integrationReqKey(id))
 	assert.False(t, found, "request context should be deleted after the response cycle")
@@ -473,7 +474,7 @@ func TestIntegration_ClientCredentialsFlow(t *testing.T) {
 	defer srv.Close()
 
 	resp := runPluginCycle(t, marshalConfig(t, ccConfig(srv.URL)),
-		consentRequest(20, "did:key:zAlice"), []byte(`{"ok":true}`), "application/json")
+		consentRequest(20, "did:key:zAlice"), []byte(`{"ok":true}`))
 
 	assert.Nil(t, resp.writtenBody, "granted consent via client credentials should pass through")
 }
@@ -486,7 +487,7 @@ func TestIntegration_ClientCredentialsDenied(t *testing.T) {
 	defer srv.Close()
 
 	resp := runPluginCycle(t, marshalConfig(t, ccConfig(srv.URL)),
-		consentRequest(21, "did:key:zAlice"), []byte(`{"secret":"x"}`), "application/json")
+		consentRequest(21, "did:key:zAlice"), []byte(`{"secret":"x"}`))
 
 	assert.Equal(t, 403, resp.writtenStatus)
 	assert.Equal(t, defaultDenyBody, string(resp.writtenBody))
