@@ -52,6 +52,10 @@ linters:
         - G104
 
   exclusions:
+    # Directories excluded from all linters (v2 replacement for the former
+    # top-level issues.exclude-dirs).
+    paths:
+      - vendor
     # Do not flag repeated string literals in test files — test data
     # naturally repeats values and extracting constants harms readability.
     rules:
@@ -69,7 +73,3 @@ linters:
           - revive
         path: internal/consent/models\.go
         text: "stutters"
-
-issues:
-  exclude-dirs:
-    - vendor

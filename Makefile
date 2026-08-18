@@ -4,8 +4,8 @@
 BINARY_NAME := go-runner
 
 # Docker image configuration
-DOCKER_IMAGE := consent-plugin
-DOCKER_TAG := latest
+DOCKER_IMAGE := quay.io/wi_stefan/consent-plugin
+DOCKER_TAG := 0.0.1
 
 # Go build flags
 GO_BUILD_FLAGS := -trimpath -ldflags="-s -w"

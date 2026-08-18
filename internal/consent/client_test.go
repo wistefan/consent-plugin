@@ -3,9 +3,10 @@ package consent
 import (
 	"context"
 	"encoding/json"
-	"io"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 
@@ -13,538 +14,387 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestNewClient verifies the constructor applies defaults and configures timeout.
+// mockCM is a configurable mock consent-manager covering the four endpoints the
+// client uses: /participants/login, /participants/me, /users/identifier/search
+// and /consents/participants/{id}.
+type mockCM struct {
+	mu sync.Mutex
+	// behaviour
+	userID             string   // identifier-search result ("" => 404)
+	statuses           []string // consents statuses
+	selfDescriptionURL string   // /me result
+	loginStatus        int      // non-200 => login fails with this status
+	failFirstConsents  bool     // first consents call 401s, then succeeds
+	// recording
+	loginCalls, meCalls, searchCalls, consentsCalls int
+	lastConsentKey, lastSearchEmail, lastSearchSD   string
+	lastConsentsAuth, lastLoginAuthClientID         string
+	tokenCounter                                    int
+}
+
+func newMockCM(t *testing.T, m *mockCM) *httptest.Server {
+	t.Helper()
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("/v1/participants/login", func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]string
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		m.mu.Lock()
+		m.loginCalls++
+		m.lastLoginAuthClientID = body["clientID"]
+		st := m.loginStatus
+		m.tokenCounter++
+		tok := fmt.Sprintf("token-%d", m.tokenCounter)
+		m.mu.Unlock()
+		if st != 0 && st != http.StatusOK {
+			w.WriteHeader(st)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "jwt": tok})
+	})
+
+	mux.HandleFunc("/v1/participants/me", func(w http.ResponseWriter, r *http.Request) {
+		m.mu.Lock()
+		m.meCalls++
+		sd := m.selfDescriptionURL
+		m.mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{"selfDescriptionURL": sd})
+	})
+
+	mux.HandleFunc("/v1/users/identifier/search", func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]string
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		m.mu.Lock()
+		m.searchCalls++
+		m.lastConsentKey = r.Header.Get(consentKeyHeader)
+		m.lastSearchEmail = body["email"]
+		m.lastSearchSD = body["selfDescription"]
+		uid := m.userID
+		m.mu.Unlock()
+		if uid == "" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{"userIdentifier": uid})
+	})
+
+	mux.HandleFunc("/v1/consents/participants/", func(w http.ResponseWriter, r *http.Request) {
+		m.mu.Lock()
+		m.consentsCalls++
+		n := m.consentsCalls
+		m.lastConsentsAuth = r.Header.Get("Authorization")
+		fail := m.failFirstConsents
+		sts := append([]string(nil), m.statuses...)
+		m.mu.Unlock()
+		if fail && n == 1 {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		consents := make([]map[string]string, 0, len(sts))
+		for _, s := range sts {
+			consents = append(consents, map[string]string{"status": s})
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"consents": consents})
+	})
+
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// resetCredCache clears the package-wide credential cache between tests.
+func resetCredCache() {
+	credCacheMu.Lock()
+	credCache = map[string]*cacheEntry{}
+	credCacheMu.Unlock()
+}
+
+// TestNewClient verifies the constructor applies defaults and stores parameters.
 func TestNewClient(t *testing.T) {
-	tests := []struct {
-		name        string
-		baseURL     string
-		timeoutMs   int
-		wantTimeout time.Duration
-		wantBaseURL string
-	}{
-		{
-			name:        "valid timeout",
-			baseURL:     "http://localhost:8080",
-			timeoutMs:   3000,
-			wantTimeout: 3000 * time.Millisecond,
-			wantBaseURL: "http://localhost:8080",
-		},
-		{
-			name:        "zero timeout uses default",
-			baseURL:     "http://consent-api:9090",
-			timeoutMs:   0,
-			wantTimeout: time.Duration(DefaultTimeoutMs) * time.Millisecond,
-			wantBaseURL: "http://consent-api:9090",
-		},
-		{
-			name:        "negative timeout uses default",
-			baseURL:     "http://example.com",
-			timeoutMs:   -100,
-			wantTimeout: time.Duration(DefaultTimeoutMs) * time.Millisecond,
-			wantBaseURL: "http://example.com",
-		},
-		{
-			name:        "minimum timeout",
-			baseURL:     "http://example.com",
-			timeoutMs:   MinTimeoutMs,
-			wantTimeout: time.Duration(MinTimeoutMs) * time.Millisecond,
-			wantBaseURL: "http://example.com",
-		},
-	}
+	c := NewClient(ClientConfig{BaseURL: "http://cm:3000", ConsentKey: "ck", ClientID: "cid", ClientSecret: "sec"})
+	assert.Equal(t, "http://cm:3000", c.baseURL)
+	assert.Equal(t, DefaultAPIPrefix, c.apiPrefix, "empty prefix defaults to /v1")
+	assert.Equal(t, DefaultTokenTTL, c.tokenTTL, "zero ttl defaults")
+	assert.Equal(t, time.Duration(DefaultTimeoutMs)*time.Millisecond, c.httpClient.Timeout, "zero timeout defaults")
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			client := NewClient(tt.baseURL, tt.timeoutMs)
-			assert.Equal(t, tt.wantBaseURL, client.baseURL)
-			assert.Equal(t, tt.wantTimeout, client.httpClient.Timeout)
-		})
-	}
+	c2 := NewClient(ClientConfig{APIPrefix: "/v2", TokenTTL: time.Minute, TimeoutMs: 1234})
+	assert.Equal(t, "/v2", c2.apiPrefix)
+	assert.Equal(t, time.Minute, c2.tokenTTL)
+	assert.Equal(t, 1234*time.Millisecond, c2.httpClient.Timeout)
 }
 
-// TestCheckConsent uses table-driven tests with httptest.NewServer to verify
-// the full request/response lifecycle of the consent client.
+// TestCheckConsent covers the two-call decision matrix using a static token + SD
+// (no login/me involved).
 func TestCheckConsent(t *testing.T) {
+	const (
+		subject = "did:key:zSubject"
+		provSD  = "http://consent-facade:8080/participants/org-1"
+		uid     = "6a71e3567917ddaef2e2c866"
+	)
 	tests := []struct {
-		name           string
-		request        ConsentRequest
-		serverHandler  http.HandlerFunc
-		wantResponse   *ConsentResponse
-		wantErr        bool
-		wantErrContain string
+		name         string
+		userID       string
+		statuses     []string
+		wantDecision Decision
 	}{
-		{
-			name: "successful allow response",
-			request: ConsentRequest{
-				Subject:        "user-123",
-				Resource:       "/api/v1/users/456",
-				Method:         "GET",
-				Claims:         map[string]interface{}{"sub": "user-123", "scope": "read"},
-				ResponseFields: []string{"id", "name", "email"},
-			},
-			serverHandler: func(w http.ResponseWriter, r *http.Request) {
-				assertRequestMethod(t, r)
-				assertRequestContentType(t, r)
-				assertRequestBody(t, r, "user-123", "/api/v1/users/456", "GET")
-
-				w.Header().Set("Content-Type", ContentTypeJSON)
-				resp := ConsentResponse{
-					Decision: DecisionAllow,
-					Reason:   "user has full consent",
-				}
-				json.NewEncoder(w).Encode(resp)
-			},
-			wantResponse: &ConsentResponse{
-				Decision: DecisionAllow,
-				Reason:   "user has full consent",
-			},
-			wantErr: false,
-		},
-		{
-			name: "successful deny response",
-			request: ConsentRequest{
-				Subject:  "user-789",
-				Resource: "/api/v1/admin/secrets",
-				Method:   "GET",
-			},
-			serverHandler: func(w http.ResponseWriter, r *http.Request) {
-				w.Header().Set("Content-Type", ContentTypeJSON)
-				resp := ConsentResponse{
-					Decision: DecisionDeny,
-					Reason:   "no consent for this resource",
-				}
-				json.NewEncoder(w).Encode(resp)
-			},
-			wantResponse: &ConsentResponse{
-				Decision: DecisionDeny,
-				Reason:   "no consent for this resource",
-			},
-			wantErr: false,
-		},
-		{
-			name: "successful filter response with denied fields",
-			request: ConsentRequest{
-				Subject:        "user-100",
-				Resource:       "/api/v1/profile",
-				Method:         "GET",
-				ResponseFields: []string{"id", "name", "email", "phone", "address"},
-			},
-			serverHandler: func(w http.ResponseWriter, r *http.Request) {
-				w.Header().Set("Content-Type", ContentTypeJSON)
-				resp := ConsentResponse{
-					Decision:     DecisionFilter,
-					DeniedFields: []string{"email", "phone", "address"},
-					Reason:       "partial consent: PII fields restricted",
-				}
-				json.NewEncoder(w).Encode(resp)
-			},
-			wantResponse: &ConsentResponse{
-				Decision:     DecisionFilter,
-				DeniedFields: []string{"email", "phone", "address"},
-				Reason:       "partial consent: PII fields restricted",
-			},
-			wantErr: false,
-		},
-		{
-			name: "consent API returns non-200 status",
-			request: ConsentRequest{
-				Subject:  "user-err",
-				Resource: "/api/v1/data",
-				Method:   "POST",
-			},
-			serverHandler: func(w http.ResponseWriter, r *http.Request) {
-				w.WriteHeader(http.StatusInternalServerError)
-				w.Write([]byte(`{"error":"internal server error"}`))
-			},
-			wantErr:        true,
-			wantErrContain: "unexpected status code 500",
-		},
-		{
-			name: "consent API returns 400 bad request",
-			request: ConsentRequest{
-				Subject: "",
-			},
-			serverHandler: func(w http.ResponseWriter, r *http.Request) {
-				w.WriteHeader(http.StatusBadRequest)
-				w.Write([]byte(`{"error":"subject is required"}`))
-			},
-			wantErr:        true,
-			wantErrContain: "unexpected status code 400",
-		},
-		{
-			name: "malformed response body",
-			request: ConsentRequest{
-				Subject:  "user-bad",
-				Resource: "/api/v1/data",
-				Method:   "GET",
-			},
-			serverHandler: func(w http.ResponseWriter, r *http.Request) {
-				w.Header().Set("Content-Type", ContentTypeJSON)
-				w.WriteHeader(http.StatusOK)
-				w.Write([]byte(`{not valid json`))
-			},
-			wantErr:        true,
-			wantErrContain: "failed to unmarshal response",
-		},
-		{
-			name: "response with empty decision field",
-			request: ConsentRequest{
-				Subject:  "user-empty",
-				Resource: "/api/v1/data",
-				Method:   "GET",
-			},
-			serverHandler: func(w http.ResponseWriter, r *http.Request) {
-				w.Header().Set("Content-Type", ContentTypeJSON)
-				w.WriteHeader(http.StatusOK)
-				w.Write([]byte(`{"decision":"","reason":"missing"}`))
-			},
-			wantErr:        true,
-			wantErrContain: "decision field is empty",
-		},
-		{
-			name: "response with unrecognized decision",
-			request: ConsentRequest{
-				Subject:  "user-unknown",
-				Resource: "/api/v1/data",
-				Method:   "GET",
-			},
-			serverHandler: func(w http.ResponseWriter, r *http.Request) {
-				w.Header().Set("Content-Type", ContentTypeJSON)
-				w.WriteHeader(http.StatusOK)
-				w.Write([]byte(`{"decision":"maybe","reason":"uncertain"}`))
-			},
-			wantErr:        true,
-			wantErrContain: "unrecognized decision",
-		},
-		{
-			name: "request with nil claims",
-			request: ConsentRequest{
-				Subject:  "user-nil",
-				Resource: "/api/v1/data",
-				Method:   "GET",
-				Claims:   nil,
-			},
-			serverHandler: func(w http.ResponseWriter, r *http.Request) {
-				w.Header().Set("Content-Type", ContentTypeJSON)
-				resp := ConsentResponse{
-					Decision: DecisionAllow,
-					Reason:   "allowed with no claims",
-				}
-				json.NewEncoder(w).Encode(resp)
-			},
-			wantResponse: &ConsentResponse{
-				Decision: DecisionAllow,
-				Reason:   "allowed with no claims",
-			},
-			wantErr: false,
-		},
-		{
-			name: "empty response body with 200 status",
-			request: ConsentRequest{
-				Subject:  "user-empty-body",
-				Resource: "/api/v1/data",
-				Method:   "GET",
-			},
-			serverHandler: func(w http.ResponseWriter, r *http.Request) {
-				w.Header().Set("Content-Type", ContentTypeJSON)
-				w.WriteHeader(http.StatusOK)
-				// Write nothing — empty body
-			},
-			wantErr:        true,
-			wantErrContain: "failed to unmarshal response",
-		},
+		{name: "granted -> allow", userID: uid, statuses: []string{"granted"}, wantDecision: DecisionAllow},
+		{name: "one of many granted -> allow", userID: uid, statuses: []string{"revoked", "granted"}, wantDecision: DecisionAllow},
+		{name: "only revoked -> deny", userID: uid, statuses: []string{"revoked"}, wantDecision: DecisionDeny},
+		{name: "no consents -> deny", userID: uid, statuses: []string{}, wantDecision: DecisionDeny},
+		{name: "unknown subject (404) -> deny", userID: "", statuses: nil, wantDecision: DecisionDeny},
 	}
-
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			server := httptest.NewServer(tt.serverHandler)
-			defer server.Close()
+			resetCredCache()
+			m := &mockCM{userID: tt.userID, statuses: tt.statuses}
+			srv := newMockCM(t, m)
+			c := NewClient(ClientConfig{BaseURL: srv.URL, ConsentKey: "ck", ParticipantToken: "static-token", ProviderSD: provSD})
 
-			client := NewClient(server.URL, DefaultTimeoutMs)
-			resp, err := client.CheckConsent(context.Background(), tt.request)
-
-			if tt.wantErr {
-				require.Error(t, err)
-				assert.Contains(t, err.Error(), tt.wantErrContain)
-				assert.Nil(t, resp)
-				return
-			}
-
+			resp, err := c.CheckConsent(context.Background(), ConsentRequest{Subject: subject})
 			require.NoError(t, err)
-			require.NotNil(t, resp)
-			assert.Equal(t, tt.wantResponse.Decision, resp.Decision)
-			assert.Equal(t, tt.wantResponse.Reason, resp.Reason)
-			assert.Equal(t, tt.wantResponse.DeniedFields, resp.DeniedFields)
+			assert.Equal(t, tt.wantDecision, resp.Decision)
+
+			m.mu.Lock()
+			defer m.mu.Unlock()
+			assert.Equal(t, 0, m.loginCalls, "static token must not trigger login")
+			assert.Equal(t, 0, m.meCalls, "static SD must not trigger /me")
+			assert.Equal(t, "ck", m.lastConsentKey)
+			assert.Equal(t, provSD, m.lastSearchSD)
+			assert.Equal(t, subject, m.lastSearchEmail)
+			if tt.userID != "" {
+				assert.Equal(t, "Bearer static-token", m.lastConsentsAuth)
+			}
 		})
 	}
 }
 
-// TestCheckConsentTimeout verifies that the client respects the configured timeout.
-func TestCheckConsentTimeout(t *testing.T) {
-	// slowResponseDelay is how long the mock server waits before responding,
-	// chosen to exceed the client's timeout.
-	const slowResponseDelay = 200 * time.Millisecond
-	// shortTimeoutMs is the client timeout in milliseconds, set lower than
-	// slowResponseDelay so the request times out.
-	const shortTimeoutMs = 50
+// TestCheckConsent_ClientCredentials verifies the full client-credentials flow:
+// login for a token, derive the provider SD from /me, then run the two calls.
+func TestCheckConsent_ClientCredentials(t *testing.T) {
+	resetCredCache()
+	m := &mockCM{userID: "uid-1", statuses: []string{"granted"}, selfDescriptionURL: "http://facade/participants/derived"}
+	srv := newMockCM(t, m)
+	c := NewClient(ClientConfig{BaseURL: srv.URL, ConsentKey: "ck", ClientID: "consent-demo-provider", ClientSecret: "demo"})
 
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		time.Sleep(slowResponseDelay)
-		w.Header().Set("Content-Type", ContentTypeJSON)
-		json.NewEncoder(w).Encode(ConsentResponse{Decision: DecisionAllow})
-	}))
-	defer server.Close()
+	resp, err := c.CheckConsent(context.Background(), ConsentRequest{Subject: "did:key:z"})
+	require.NoError(t, err)
+	assert.Equal(t, DecisionAllow, resp.Decision)
 
-	client := NewClient(server.URL, shortTimeoutMs)
-	resp, err := client.CheckConsent(context.Background(), ConsentRequest{
-		Subject:  "user-timeout",
-		Resource: "/api/v1/data",
-		Method:   "GET",
-	})
-
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "HTTP request failed")
-	assert.Nil(t, resp)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	assert.Equal(t, 1, m.loginCalls)
+	assert.Equal(t, "consent-demo-provider", m.lastLoginAuthClientID)
+	assert.Equal(t, 1, m.meCalls)
+	assert.Equal(t, "http://facade/participants/derived", m.lastSearchSD, "SD derived from /me is used in the search")
+	assert.Equal(t, "Bearer token-1", m.lastConsentsAuth, "the fetched token is used on the consents call")
 }
 
-// TestCheckConsentContextCancellation verifies that the client respects
-// context cancellation.
-func TestCheckConsentContextCancellation(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Wait long enough that cancellation takes effect.
-		time.Sleep(500 * time.Millisecond)
-		w.Header().Set("Content-Type", ContentTypeJSON)
-		json.NewEncoder(w).Encode(ConsentResponse{Decision: DecisionAllow})
-	}))
-	defer server.Close()
+// TestCheckConsent_TokenAndSDCached verifies the token and derived SD are cached
+// across calls (login + /me happen once).
+func TestCheckConsent_TokenAndSDCached(t *testing.T) {
+	resetCredCache()
+	m := &mockCM{userID: "uid-1", statuses: []string{"granted"}, selfDescriptionURL: "http://facade/participants/derived"}
+	srv := newMockCM(t, m)
+	c := NewClient(ClientConfig{BaseURL: srv.URL, ConsentKey: "ck", ClientID: "cid", ClientSecret: "sec"})
 
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel() // Cancel immediately.
-
-	client := NewClient(server.URL, DefaultTimeoutMs)
-	resp, err := client.CheckConsent(ctx, ConsentRequest{
-		Subject:  "user-cancel",
-		Resource: "/api/v1/data",
-		Method:   "GET",
-	})
-
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "HTTP request failed")
-	assert.Nil(t, resp)
-}
-
-// TestCheckConsentInvalidURL verifies that the client returns an error when
-// the base URL is unreachable.
-func TestCheckConsentInvalidURL(t *testing.T) {
-	client := NewClient("http://localhost:1", MinTimeoutMs)
-	resp, err := client.CheckConsent(context.Background(), ConsentRequest{
-		Subject:  "user-bad-url",
-		Resource: "/api/v1/data",
-		Method:   "GET",
-	})
-
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "HTTP request failed")
-	assert.Nil(t, resp)
-}
-
-// TestCheckConsentRequestSerialization verifies that the ConsentRequest is
-// correctly serialized to JSON in the HTTP request body.
-func TestCheckConsentRequestSerialization(t *testing.T) {
-	var receivedBody ConsentRequest
-
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		bodyBytes, err := io.ReadAll(r.Body)
+	for i := 0; i < 3; i++ {
+		resp, err := c.CheckConsent(context.Background(), ConsentRequest{Subject: "did:key:z"})
 		require.NoError(t, err)
-		err = json.Unmarshal(bodyBytes, &receivedBody)
-		require.NoError(t, err)
-
-		w.Header().Set("Content-Type", ContentTypeJSON)
-		json.NewEncoder(w).Encode(ConsentResponse{Decision: DecisionAllow})
-	}))
-	defer server.Close()
-
-	req := ConsentRequest{
-		Subject:        "test-subject",
-		Resource:       "/api/v1/users",
-		Method:         "POST",
-		Claims:         map[string]interface{}{"sub": "test-subject", "role": "admin"},
-		ResponseFields: []string{"id", "name", "email"},
+		assert.Equal(t, DecisionAllow, resp.Decision)
 	}
 
-	client := NewClient(server.URL, DefaultTimeoutMs)
-	_, err := client.CheckConsent(context.Background(), req)
-	require.NoError(t, err)
-
-	assert.Equal(t, "test-subject", receivedBody.Subject)
-	assert.Equal(t, "/api/v1/users", receivedBody.Resource)
-	assert.Equal(t, "POST", receivedBody.Method)
-	assert.Equal(t, []string{"id", "name", "email"}, receivedBody.ResponseFields)
-	// Claims are deserialized as map[string]interface{}
-	assert.Equal(t, "test-subject", receivedBody.Claims["sub"])
-	assert.Equal(t, "admin", receivedBody.Claims["role"])
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	assert.Equal(t, 1, m.loginCalls, "token should be cached across calls")
+	assert.Equal(t, 1, m.meCalls, "provider SD should be cached across calls")
+	assert.Equal(t, 3, m.consentsCalls)
 }
 
-// TestCheckConsentEndpointPath verifies that the client POSTs to the correct
-// endpoint path.
-func TestCheckConsentEndpointPath(t *testing.T) {
-	var receivedPath string
+// TestCheckConsent_401RefreshRetry verifies a 401 on the consents call triggers a
+// re-login and a single retry.
+func TestCheckConsent_401RefreshRetry(t *testing.T) {
+	resetCredCache()
+	m := &mockCM{userID: "uid-1", statuses: []string{"granted"}, selfDescriptionURL: "http://facade/sd", failFirstConsents: true}
+	srv := newMockCM(t, m)
+	c := NewClient(ClientConfig{BaseURL: srv.URL, ConsentKey: "ck", ClientID: "cid", ClientSecret: "sec"})
 
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		receivedPath = r.URL.Path
-		w.Header().Set("Content-Type", ContentTypeJSON)
-		json.NewEncoder(w).Encode(ConsentResponse{Decision: DecisionAllow})
-	}))
-	defer server.Close()
-
-	client := NewClient(server.URL, DefaultTimeoutMs)
-	_, err := client.CheckConsent(context.Background(), ConsentRequest{
-		Subject:  "user-path",
-		Resource: "/test",
-		Method:   "GET",
-	})
+	resp, err := c.CheckConsent(context.Background(), ConsentRequest{Subject: "did:key:z"})
 	require.NoError(t, err)
-	assert.Equal(t, CheckEndpointPath, receivedPath)
+	assert.Equal(t, DecisionAllow, resp.Decision)
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	assert.Equal(t, 2, m.loginCalls, "401 should force a re-login")
+	assert.Equal(t, 2, m.consentsCalls, "the consents call should be retried once")
+	assert.Equal(t, "Bearer token-2", m.lastConsentsAuth, "the retry uses the refreshed token")
+}
+
+// TestCheckConsent_LoginFailure surfaces a login error.
+func TestCheckConsent_LoginFailure(t *testing.T) {
+	resetCredCache()
+	m := &mockCM{userID: "uid-1", statuses: []string{"granted"}, loginStatus: http.StatusNotFound}
+	srv := newMockCM(t, m)
+	c := NewClient(ClientConfig{BaseURL: srv.URL, ConsentKey: "ck", ClientID: "cid", ClientSecret: "wrong"})
+
+	_, err := c.CheckConsent(context.Background(), ConsentRequest{Subject: "did:key:z"})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "participant login returned status 404")
+}
+
+// TestCheckConsent_ProviderSDOverride verifies an explicit provider_sd skips /me
+// while still using client credentials for the token.
+func TestCheckConsent_ProviderSDOverride(t *testing.T) {
+	resetCredCache()
+	m := &mockCM{userID: "uid-1", statuses: []string{"granted"}}
+	srv := newMockCM(t, m)
+	c := NewClient(ClientConfig{BaseURL: srv.URL, ConsentKey: "ck", ClientID: "cid", ClientSecret: "sec", ProviderSD: "http://facade/explicit"})
+
+	resp, err := c.CheckConsent(context.Background(), ConsentRequest{Subject: "did:key:z"})
+	require.NoError(t, err)
+	assert.Equal(t, DecisionAllow, resp.Decision)
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	assert.Equal(t, 1, m.loginCalls, "token still comes from login")
+	assert.Equal(t, 0, m.meCalls, "explicit provider_sd skips /me")
+	assert.Equal(t, "http://facade/explicit", m.lastSearchSD)
+}
+
+// TestCheckConsent_EmptySubject denies without contacting the consent-manager.
+func TestCheckConsent_EmptySubject(t *testing.T) {
+	resetCredCache()
+	m := &mockCM{userID: "uid", statuses: []string{"granted"}}
+	srv := newMockCM(t, m)
+	c := NewClient(ClientConfig{BaseURL: srv.URL, ConsentKey: "ck", ClientID: "cid", ClientSecret: "sec"})
+
+	resp, err := c.CheckConsent(context.Background(), ConsentRequest{Subject: ""})
+	require.NoError(t, err)
+	assert.Equal(t, DecisionDeny, resp.Decision)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	assert.Equal(t, 0, m.loginCalls)
+	assert.Equal(t, 0, m.searchCalls)
+}
+
+// TestCheckConsent_MissingCredentials errors when neither a static token nor
+// client credentials are configured.
+func TestCheckConsent_MissingCredentials(t *testing.T) {
+	resetCredCache()
+	c := NewClient(ClientConfig{BaseURL: "http://cm:3000", ConsentKey: "ck"})
+	_, err := c.CheckConsent(context.Background(), ConsentRequest{Subject: "did:key:z"})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "no participant_token and no client_id/client_secret")
+}
+
+// TestCheckConsent_EmptyConsentKeyOmitsHeader verifies that an empty consent key
+// is allowed (it is optional — injected by the facade when present) and that the
+// x-visionstrust-consent-key header is then not sent at all, rather than sent empty.
+func TestCheckConsent_EmptyConsentKeyOmitsHeader(t *testing.T) {
+	resetCredCache()
+	m := &mockCM{userID: "uid-1", statuses: []string{"granted"}}
+	srv := newMockCM(t, m)
+	c := NewClient(ClientConfig{BaseURL: srv.URL, ParticipantToken: "t", ProviderSD: "sd"})
+	resp, err := c.CheckConsent(context.Background(), ConsentRequest{Subject: "did:key:z"})
+	require.NoError(t, err)
+	assert.Equal(t, DecisionAllow, resp.Decision)
+	assert.Empty(t, m.lastConsentKey, "empty consent key must not be sent as a header")
+}
+
+// TestCheckConsent_ConcurrentLoginCoalesced verifies that concurrent first
+// requests for the same participant coalesce onto a single client-credentials
+// login (no stampede) and a single /me fetch, rather than one per goroutine.
+func TestCheckConsent_ConcurrentLoginCoalesced(t *testing.T) {
+	resetCredCache()
+	m := &mockCM{userID: "uid-1", statuses: []string{"granted"}, selfDescriptionURL: "sd"}
+	srv := newMockCM(t, m)
+
+	const n = 20
+	var wg sync.WaitGroup
+	errs := make(chan error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			// Same base URL + client id => same cache key, so the login must coalesce.
+			c := NewClient(ClientConfig{BaseURL: srv.URL, ClientID: "cid", ClientSecret: "sec"})
+			resp, err := c.CheckConsent(context.Background(), ConsentRequest{Subject: "did:key:z"})
+			if err != nil {
+				errs <- err
+			} else if resp.Decision != DecisionAllow {
+				errs <- fmt.Errorf("decision = %v, want allow", resp.Decision)
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		require.NoError(t, err)
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	assert.Equal(t, 1, m.loginCalls, "concurrent first requests must coalesce onto one login")
+	assert.Equal(t, 1, m.meCalls, "provider SD should be fetched once and cached")
+}
+
+// TestCheckConsentTransportFailure verifies an unreachable consent-manager errors.
+func TestCheckConsentTransportFailure(t *testing.T) {
+	resetCredCache()
+	c := NewClient(ClientConfig{BaseURL: "http://localhost:1", ConsentKey: "ck", ParticipantToken: "t", ProviderSD: "sd", TimeoutMs: MinTimeoutMs})
+	_, err := c.CheckConsent(context.Background(), ConsentRequest{Subject: "did:key:z"})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "HTTP request failed")
+}
+
+// TestCheckConsentContextCancellation verifies context cancellation is honored.
+func TestCheckConsentContextCancellation(t *testing.T) {
+	resetCredCache()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(500 * time.Millisecond)
+	}))
+	defer srv.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	c := NewClient(ClientConfig{BaseURL: srv.URL, ConsentKey: "ck", ParticipantToken: "t", ProviderSD: "sd"})
+	_, err := c.CheckConsent(ctx, ConsentRequest{Subject: "did:key:z"})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "HTTP request failed")
 }
 
 // TestDecisionIsValid verifies the Decision.IsValid method.
 func TestDecisionIsValid(t *testing.T) {
-	tests := []struct {
-		name     string
-		decision Decision
-		want     bool
-	}{
-		{name: "allow is valid", decision: DecisionAllow, want: true},
-		{name: "deny is valid", decision: DecisionDeny, want: true},
-		{name: "filter is valid", decision: DecisionFilter, want: true},
-		{name: "empty is invalid", decision: "", want: false},
-		{name: "unknown is invalid", decision: "maybe", want: false},
-		{name: "uppercase is invalid", decision: "ALLOW", want: false},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			assert.Equal(t, tt.want, tt.decision.IsValid())
-		})
-	}
+	assert.True(t, DecisionAllow.IsValid())
+	assert.True(t, DecisionDeny.IsValid())
+	assert.True(t, DecisionFilter.IsValid())
+	assert.False(t, Decision("").IsValid())
+	assert.False(t, Decision("maybe").IsValid())
 }
 
 // TestConsentResponseValidate verifies the Validate method on ConsentResponse.
 func TestConsentResponseValidate(t *testing.T) {
-	tests := []struct {
-		name           string
-		response       ConsentResponse
-		wantErr        bool
-		wantErrContain string
-	}{
-		{
-			name:     "valid allow response",
-			response: ConsentResponse{Decision: DecisionAllow},
-			wantErr:  false,
-		},
-		{
-			name:     "valid deny response",
-			response: ConsentResponse{Decision: DecisionDeny, Reason: "no consent"},
-			wantErr:  false,
-		},
-		{
-			name:     "valid filter response",
-			response: ConsentResponse{Decision: DecisionFilter, DeniedFields: []string{"email"}},
-			wantErr:  false,
-		},
-		{
-			name:           "empty decision",
-			response:       ConsentResponse{Decision: ""},
-			wantErr:        true,
-			wantErrContain: "decision field is empty",
-		},
-		{
-			name:           "unrecognized decision",
-			response:       ConsentResponse{Decision: "block"},
-			wantErr:        true,
-			wantErrContain: "unrecognized decision",
-		},
-	}
+	require.NoError(t, (&ConsentResponse{Decision: DecisionAllow}).Validate())
+	require.NoError(t, (&ConsentResponse{Decision: DecisionDeny, Reason: "no consent"}).Validate())
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			err := tt.response.Validate()
-			if tt.wantErr {
-				require.Error(t, err)
-				assert.Contains(t, err.Error(), tt.wantErrContain)
-			} else {
-				require.NoError(t, err)
-			}
-		})
-	}
+	err := (&ConsentResponse{Decision: ""}).Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "decision field is empty")
+
+	err = (&ConsentResponse{Decision: "block"}).Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "unrecognized decision")
 }
 
 // TestTruncateBody verifies the body truncation helper.
 func TestTruncateBody(t *testing.T) {
-	tests := []struct {
-		name       string
-		body       []byte
-		wantSuffix bool
-	}{
-		{
-			name:       "short body not truncated",
-			body:       []byte("short error message"),
-			wantSuffix: false,
-		},
-		{
-			name:       "empty body",
-			body:       []byte{},
-			wantSuffix: false,
-		},
-		{
-			name:       "body at max length not truncated",
-			body:       make([]byte, maxBodyLogLength),
-			wantSuffix: false,
-		},
-		{
-			name:       "body exceeding max length is truncated",
-			body:       make([]byte, maxBodyLogLength+100),
-			wantSuffix: true,
-		},
-	}
+	assert.Equal(t, "short", truncateBody([]byte("short")))
+	assert.Equal(t, "", truncateBody([]byte{}))
+	assert.NotContains(t, truncateBody(make([]byte, maxBodyLogLength)), "...(truncated)")
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := truncateBody(tt.body)
-			if tt.wantSuffix {
-				assert.Contains(t, result, "...(truncated)")
-				// Should contain exactly maxBodyLogLength bytes of content before truncation marker.
-				assert.Equal(t, maxBodyLogLength+len("...(truncated)"), len(result))
-			} else {
-				assert.NotContains(t, result, "...(truncated)")
-				assert.Equal(t, string(tt.body), result)
-			}
-		})
-	}
-}
-
-// assertRequestMethod checks that the HTTP request used POST method.
-func assertRequestMethod(t *testing.T, r *http.Request) {
-	t.Helper()
-	assert.Equal(t, http.MethodPost, r.Method)
-}
-
-// assertRequestContentType checks the Content-Type header.
-func assertRequestContentType(t *testing.T, r *http.Request) {
-	t.Helper()
-	assert.Equal(t, ContentTypeJSON, r.Header.Get("Content-Type"))
-}
-
-// assertRequestBody reads and validates the request body fields.
-func assertRequestBody(t *testing.T, r *http.Request, wantSubject, wantResource, wantMethod string) {
-	t.Helper()
-	bodyBytes, err := io.ReadAll(r.Body)
-	require.NoError(t, err)
-
-	var req ConsentRequest
-	err = json.Unmarshal(bodyBytes, &req)
-	require.NoError(t, err)
-
-	assert.Equal(t, wantSubject, req.Subject)
-	assert.Equal(t, wantResource, req.Resource)
-	assert.Equal(t, wantMethod, req.Method)
+	long := truncateBody(make([]byte, maxBodyLogLength+100))
+	assert.Contains(t, long, "...(truncated)")
+	assert.Equal(t, maxBodyLogLength+len("...(truncated)"), len(long))
 }

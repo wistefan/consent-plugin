@@ -217,6 +217,70 @@ func TestParseConfig(t *testing.T) {
 	}
 }
 
+// TestParseConfig_EnvFallback verifies the credential fields fall back to their
+// env vars when omitted from the route config, and that a value in the config
+// always takes precedence over the env var.
+func TestParseConfig_EnvFallback(t *testing.T) {
+	t.Run("env fills empty credential fields", func(t *testing.T) {
+		t.Setenv(EnvConsentKey, "ck-from-env")
+		t.Setenv(EnvClientID, "cid-from-env")
+		t.Setenv(EnvClientSecret, "sec-from-env")
+
+		cfg, err := ParseConfig(toJSON(t, validConfigJSON()))
+		require.NoError(t, err)
+		assert.Equal(t, "ck-from-env", cfg.ConsentKey)
+		assert.Equal(t, "cid-from-env", cfg.ClientID)
+		assert.Equal(t, "sec-from-env", cfg.ClientSecret)
+	})
+
+	t.Run("config values win over env", func(t *testing.T) {
+		t.Setenv(EnvConsentKey, "ck-from-env")
+		t.Setenv(EnvClientID, "cid-from-env")
+		t.Setenv(EnvClientSecret, "sec-from-env")
+
+		in := validConfigJSON()
+		in["consent_key"] = "ck-from-config"
+		in["client_id"] = "cid-from-config"
+		in["client_secret"] = "sec-from-config"
+		cfg, err := ParseConfig(toJSON(t, in))
+		require.NoError(t, err)
+		assert.Equal(t, "ck-from-config", cfg.ConsentKey)
+		assert.Equal(t, "cid-from-config", cfg.ClientID)
+		assert.Equal(t, "sec-from-config", cfg.ClientSecret)
+	})
+}
+
+// TestParseConfig_Audit covers the audit config: enabling requires an endpoint,
+// and the endpoint falls back to its env var.
+func TestParseConfig_Audit(t *testing.T) {
+	t.Run("audit_enabled requires an endpoint", func(t *testing.T) {
+		in := validConfigJSON()
+		in["audit_enabled"] = true
+		_, err := ParseConfig(toJSON(t, in))
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "audit_otlp_endpoint is required")
+	})
+
+	t.Run("audit_enabled with an endpoint is valid", func(t *testing.T) {
+		in := validConfigJSON()
+		in["audit_enabled"] = true
+		in["audit_otlp_endpoint"] = "http://otel:4318"
+		cfg, err := ParseConfig(toJSON(t, in))
+		require.NoError(t, err)
+		assert.True(t, cfg.AuditEnabled)
+		assert.Equal(t, "http://otel:4318", cfg.AuditOTLPEndpoint)
+	})
+
+	t.Run("endpoint falls back to env", func(t *testing.T) {
+		t.Setenv(EnvAuditOTLPEndpoint, "http://otel-env:4318")
+		in := validConfigJSON()
+		in["audit_enabled"] = true
+		cfg, err := ParseConfig(toJSON(t, in))
+		require.NoError(t, err)
+		assert.Equal(t, "http://otel-env:4318", cfg.AuditOTLPEndpoint)
+	})
+}
+
 func TestConfig_Validate(t *testing.T) {
 	tests := []struct {
 		name      string
