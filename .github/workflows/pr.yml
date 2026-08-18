@@ -1,0 +1,32 @@
+name: PR
+
+# Fast feedback on pull requests: lint, build, tests and security scans.
+# Release/image concerns live in pre-release.yml and check.yml.
+on:
+  pull_request:
+    branches:
+      - main
+
+concurrency:
+  group: pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+# Grant the tokens the called reusable workflows need. A reusable workflow can
+# never request more than its caller allows, so security-analysis.yml's
+# `security-events: write` must be granted here.
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  style-guide:
+    uses: ./.github/workflows/style-guide.yml
+
+  build:
+    uses: ./.github/workflows/build.yml
+
+  tests:
+    uses: ./.github/workflows/tests.yml
+
+  security-analysis:
+    uses: ./.github/workflows/security-analysis.yml
