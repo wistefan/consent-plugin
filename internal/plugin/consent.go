@@ -15,8 +15,16 @@
  * limitations under the License.
  */
 
-// Package plugin implements the APISIX consent-filter plugin that intercepts
-// HTTP responses and applies consent-based filtering for personal data.
+// Package plugin implements the APISIX consent-filter plugin.
+//
+// The plugin gates a personal-data response on the consent of the DATA OWNER.
+// The request phase captures the token's claims; the response phase asks the
+// OwnerResolver who owns the payload and checks, per owner, that the consuming
+// participant has a granted consent. The verdict is coarse — the whole response
+// is allowed or replaced with a denial. Despite the plugin's registered name
+// there is no field-level filtering or redaction: a gate that removes fields
+// silently misses the one it does not know about, while a coarse gate still
+// covers an empty or non-JSON personal-data response.
 package plugin
 
 import (
@@ -91,11 +99,9 @@ func (c *ConsentFilter) ParseConf(in []byte) (interface{}, error) {
 	return ParseConfig(in)
 }
 
-// RequestFilter intercepts incoming HTTP requests to capture request context
-// (headers, JWT claims, path, method) for use during response filtering.
-// It extracts the JWT from the configured header, decodes the requested claims,
-// captures all request headers, and stores the context keyed by request ID
-// for later retrieval in ResponseFilter.
+// RequestFilter intercepts incoming HTTP requests to capture the context the
+// response phase needs: the method, the path, and the claims decoded from the
+// configured JWT header, stored under the request's correlation key.
 //
 // The JWT is decoded, NOT verified (see internal/jwt): the claims are used only
 // to name the consuming participant for the contract lookup, and the route MUST

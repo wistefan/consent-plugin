@@ -15,8 +15,6 @@
  * limitations under the License.
  */
 
-// Package plugin implements the APISIX consent-filter plugin that intercepts
-// HTTP responses and applies consent-based filtering for personal data.
 package plugin
 
 import (

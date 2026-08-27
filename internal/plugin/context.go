@@ -24,9 +24,8 @@ import (
 	"time"
 )
 
-// RequestContext holds the captured request information that is needed
-// during response filtering. It is stored during RequestFilter and
-// retrieved during ResponseFilter.
+// RequestContext holds the captured request information the response phase
+// needs. It is stored during RequestFilter and retrieved during ResponseFilter.
 //
 // It deliberately holds no request headers. The only thing the response phase
 // needs from the request is the method, the path and the decoded claims; keeping
