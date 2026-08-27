@@ -242,27 +242,40 @@ func (c *ConsentFilter) evaluateWithResolver(cfg *Config, w pkgHTTP.Response, ke
 		contentType = h.Get("Content-Type")
 	}
 
-	resolverClient := ownerresolver.NewClient(cfg.OwnerResolverURL, cfg.OwnerResolverTimeout)
 	// Parties are for CONTRACT identification only - never for ownership. The
 	// token names the consumer by DID, while contracts name their parties by
 	// self-description URL, so translate it via the participant registry.
+	//
+	// Both sides are resolved BEFORE the resolver is asked anything, and a failure
+	// on either is terminal. Proceeding with an empty Parties would omit the field
+	// from /resolve entirely, and a resolver that cannot identify a contract may
+	// answer consentRequired:false — which is an unconditional allow. That would
+	// put a fail-open seam in the middle of a fail-closed design, reachable by
+	// nothing more than a briefly unreachable consent-manager or a revoked token.
 	resolveParties := ownerresolver.Parties{}
-	if consumerDID := consumerFromClaims(reqCtx.JWTClaims, cfg.ConsumerClaim); consumerDID != "" {
-		if consumerSD, sdErr := consentClient.ParticipantSelfDescriptionByDID(context.Background(), consumerDID); sdErr != nil {
-			log.Printf("[consent-filter] ResponseFilter: could not map consumer did %q to a participant for request %s: %v", consumerDID, key, sdErr)
-		} else {
-			resolveParties.Consumer = consumerSD
-		}
+	consumerDID := consumerFromClaims(reqCtx.JWTClaims, cfg.ConsumerClaim)
+	if consumerDID == "" {
+		log.Printf("[consent-filter] ResponseFilter: no consuming participant in the token claims (path %q) for request %s", cfg.ConsumerClaim, key)
+		return failOutcome(cfg, "no consuming participant identified", key, nil)
+	}
+	consumerSD, sdErr := consentClient.ParticipantSelfDescriptionByDID(context.Background(), consumerDID)
+	if sdErr != nil {
+		log.Printf("[consent-filter] ResponseFilter: could not map the consumer to a participant for request %s: %v", key, sdErr)
+		return failOutcome(cfg, "consumer participant lookup failed: "+sdErr.Error(), key, nil)
 	}
 	// The consumer also scopes the consent match itself: a consent names the one
 	// participant it was granted to, so releasing data to any other participant
 	// on the strength of it would authorise an agreement the subject never made.
-	consumerSD := resolveParties.Consumer
-	if providerSD, sdErr := consentClient.ProviderSelfDescription(context.Background()); sdErr != nil {
+	resolveParties.Consumer = consumerSD
+
+	providerSD, sdErr := consentClient.ProviderSelfDescription(context.Background())
+	if sdErr != nil {
 		log.Printf("[consent-filter] ResponseFilter: could not determine the provider self-description for request %s: %v", key, sdErr)
-	} else {
-		resolveParties.Provider = providerSD
+		return failOutcome(cfg, "provider self-description lookup failed: "+sdErr.Error(), key, nil)
 	}
+	resolveParties.Provider = providerSD
+
+	resolverClient := ownerresolver.NewClient(cfg.OwnerResolverURL, cfg.OwnerResolverTimeout)
 	result, err := resolverClient.Resolve(context.Background(), ownerresolver.Resource{
 		Service:     cfg.Service,
 		Method:      reqCtx.Method,
@@ -420,8 +433,8 @@ const claimPathSeparator = "."
 
 // consumerFromClaims reads the consuming participant from a dotted claim path
 // (e.g. "verifiableCredential.issuer"). It returns "" when the path is unset or
-// does not resolve to a string - the resolver then reports that it cannot
-// identify the contract, and the fail policy applies.
+// does not resolve to a string, which the caller treats as a failure to identify
+// the exchange - the fail policy then applies.
 func consumerFromClaims(claims map[string]interface{}, path string) string {
 	if len(claims) == 0 || path == "" {
 		return ""

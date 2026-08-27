@@ -462,6 +462,36 @@ func TestConsentFilter_ResponseFilter(t *testing.T) {
 			wantWrittenStatus: DefaultDenyStatusCode,
 		},
 		{
+			name: "unresolvable consumer denies without asking the resolver",
+			setupContext: func(id uint32) {
+				StoreRequestContext(testReqKey(id), &RequestContext{
+					Method: "GET", Path: "/data",
+					JWTClaims: map[string]interface{}{
+						"verifiableCredential": map[string]interface{}{"issuer": "did:key:zNotRegistered"},
+					},
+				})
+			},
+			consentServer:     newUncalledConsentManager,
+			resolverServer:    newUncalledOwnerResolver,
+			configFn:          func(cfg *Config) { cfg.FailOpen = boolPtr(false) },
+			wantWrittenBody:   DefaultDenyResponseBody,
+			wantWrittenStatus: DefaultDenyStatusCode,
+		},
+		{
+			name: "no consumer claim in the token denies without asking the resolver",
+			setupContext: func(id uint32) {
+				StoreRequestContext(testReqKey(id), &RequestContext{
+					Method: "GET", Path: "/data",
+					JWTClaims: map[string]interface{}{"sub": "did:key:zCaller"},
+				})
+			},
+			consentServer:     newUncalledConsentManager,
+			resolverServer:    newUncalledOwnerResolver,
+			configFn:          func(cfg *Config) { cfg.FailOpen = boolPtr(false) },
+			wantWrittenBody:   DefaultDenyResponseBody,
+			wantWrittenStatus: DefaultDenyStatusCode,
+		},
+		{
 			name:           "invalid config type passes through",
 			setupContext:   storeRequest,
 			consentServer:  newUncalledConsentManager,

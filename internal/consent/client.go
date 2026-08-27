@@ -371,9 +371,18 @@ func (c *Client) credentials(ctx context.Context, forceFetch bool) (token, provi
 // off the request path.
 const participantSDCacheTTL = 10 * time.Minute
 
+// participantSDNegativeTTL bounds how long a "no such participant" answer is
+// reused. Without it a single misconfigured DID re-fetches the whole participant
+// list on every request; with it, a participant that is genuinely registered
+// later is still picked up promptly.
+const participantSDNegativeTTL = 30 * time.Second
+
 type participantSDEntry struct {
 	selfDescriptionURL string
 	expiry             time.Time
+	// unknown marks a negative result: the registry answered, and no participant
+	// with this DID was in it.
+	unknown bool
 }
 
 var (
@@ -396,21 +405,58 @@ type participantsResponse struct {
 // URL using the consent-manager's participant registry. Contracts name their
 // parties by self-description URL, so a DID taken from a credential must be
 // translated before it can be used in a contract lookup. Results are cached for
-// participantSDCacheTTL.
+// participantSDCacheTTL, and "no such participant" for participantSDNegativeTTL,
+// so a misconfigured DID does not re-fetch the registry on every request.
 func (c *Client) ParticipantSelfDescriptionByDID(ctx context.Context, did string) (string, error) {
 	if did == "" {
 		return "", fmt.Errorf("consent client: empty participant did")
 	}
-	cacheKey := c.baseURL + "|" + did
+	cacheKey := c.cacheKey() + credentialKeySeparator + did
 
 	participantSDMu.Lock()
 	entry, hit := participantSDCache[cacheKey]
 	participantSDMu.Unlock()
 	if hit && time.Now().Before(entry.expiry) {
+		if entry.unknown {
+			return "", fmt.Errorf("consent client: no participant registered for did %q", did)
+		}
 		return entry.selfDescriptionURL, nil
 	}
 
-	token, _, err := c.credentials(ctx, false)
+	// A cached token that has since been revoked would otherwise make the mapping
+	// terminally fail, and with it the whole exchange — so refresh and retry once,
+	// exactly as CheckConsent does for the check itself.
+	sd, err := c.lookupParticipantSD(ctx, did, false)
+	if errors.Is(err, errParticipantUnauthorized) && c.staticToken == "" {
+		sd, err = c.lookupParticipantSD(ctx, did, true)
+	}
+	if errors.Is(err, errParticipantUnauthorized) {
+		return "", fmt.Errorf("consent client: participant token rejected (401) on participants lookup")
+	}
+	if err != nil {
+		return "", err
+	}
+
+	participantSDMu.Lock()
+	if sd == "" {
+		participantSDCache[cacheKey] = participantSDEntry{unknown: true, expiry: time.Now().Add(participantSDNegativeTTL)}
+	} else {
+		participantSDCache[cacheKey] = participantSDEntry{selfDescriptionURL: sd, expiry: time.Now().Add(participantSDCacheTTL)}
+	}
+	participantSDMu.Unlock()
+
+	if sd == "" {
+		return "", fmt.Errorf("consent client: no participant registered for did %q", did)
+	}
+	return sd, nil
+}
+
+// lookupParticipantSD fetches the participant registry and returns the
+// self-description URL registered for did, or "" when the registry answered but
+// holds no such participant (a definite negative, not an error). forceLogin
+// refreshes a cached token first.
+func (c *Client) lookupParticipantSD(ctx context.Context, did string, forceLogin bool) (string, error) {
+	token, _, err := c.credentials(ctx, forceLogin)
 	if err != nil {
 		return "", err
 	}
@@ -437,13 +483,10 @@ func (c *Client) ParticipantSelfDescriptionByDID(ctx context.Context, did string
 	}
 	for _, p := range participants {
 		if p.DID == did && p.SelfDescriptionURL != "" {
-			participantSDMu.Lock()
-			participantSDCache[cacheKey] = participantSDEntry{selfDescriptionURL: p.SelfDescriptionURL, expiry: time.Now().Add(participantSDCacheTTL)}
-			participantSDMu.Unlock()
 			return p.SelfDescriptionURL, nil
 		}
 	}
-	return "", fmt.Errorf("consent client: no participant registered for did %q", did)
+	return "", nil
 }
 
 // decodeParticipants accepts either a bare array or a {"participants": [...]}

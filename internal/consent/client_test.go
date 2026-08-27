@@ -174,6 +174,15 @@ func resetCredCache() {
 	credCacheMu.Lock()
 	credCache = map[string]*cacheEntry{}
 	credCacheMu.Unlock()
+	resetParticipantSDCache()
+}
+
+// resetParticipantSDCache clears the package-wide DID -> self-description cache
+// between tests, so a positive or negative result cannot leak across them.
+func resetParticipantSDCache() {
+	participantSDMu.Lock()
+	participantSDCache = map[string]participantSDEntry{}
+	participantSDMu.Unlock()
 }
 
 // TestCheckConsent_HostOverride verifies the configured Host header is sent to
@@ -646,4 +655,79 @@ func TestCheckConsent_SeparateTokenServicesDoNotShareToken(t *testing.T) {
 	defer mu.Unlock()
 	assert.Equal(t, []string{"Bearer token-participant-a", "Bearer token-participant-b"}, consentsAuth,
 		"each participant must authenticate with its own token, not the first one cached")
+}
+
+// --- Participant registry lookup (the contract-side party mapping) ---
+
+// newParticipantRegistry starts a mock consent-manager participant registry that
+// counts its calls and can 401 the first one.
+func newParticipantRegistry(t *testing.T, entries []map[string]string, calls *int, fail401First *bool) *httptest.Server {
+	t.Helper()
+	var mu sync.Mutex
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		mu.Lock()
+		*calls++
+		n := *calls
+		mu.Unlock()
+		if fail401First != nil && *fail401First && n == 1 {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(entries)
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// TestParticipantSelfDescriptionByDID_401RefreshRetry verifies a rejected cached
+// token is refreshed and the registry lookup retried, rather than failing
+// terminally — a stale token must not take the whole exchange down.
+func TestParticipantSelfDescriptionByDID_401RefreshRetry(t *testing.T) {
+	resetCredCache()
+
+	var registryCalls int
+	fail := true
+	registry := newParticipantRegistry(t,
+		[]map[string]string{{"did": "did:key:zConsumer", "selfDescriptionURL": testConsumerSD}},
+		&registryCalls, &fail)
+
+	tokenSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"access_token": "tok", "token_type": "Bearer", "expires_in": 3600,
+		})
+	}))
+	t.Cleanup(tokenSrv.Close)
+
+	c := NewClient(ClientConfig{
+		BaseURL: registry.URL, APIPrefix: "", ProviderSD: "sd",
+		TokenServiceURL: tokenSrv.URL, TokenAudience: testAudience,
+	})
+
+	sd, err := c.ParticipantSelfDescriptionByDID(context.Background(), "did:key:zConsumer")
+	require.NoError(t, err)
+	assert.Equal(t, testConsumerSD, sd)
+	assert.Equal(t, 2, registryCalls, "the 401 must trigger one refresh and retry")
+}
+
+// TestParticipantSelfDescriptionByDID_NegativeCaching verifies an unknown DID is
+// remembered as unknown, so a misconfiguration does not re-fetch the whole
+// participant list on every request.
+func TestParticipantSelfDescriptionByDID_NegativeCaching(t *testing.T) {
+	resetCredCache()
+
+	var registryCalls int
+	registry := newParticipantRegistry(t, []map[string]string{}, &registryCalls, nil)
+
+	c := NewClient(ClientConfig{
+		BaseURL: registry.URL, APIPrefix: "", ParticipantToken: "static", ProviderSD: "sd",
+	})
+
+	for i := 0; i < 3; i++ {
+		_, err := c.ParticipantSelfDescriptionByDID(context.Background(), "did:key:zUnregistered")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "no participant registered")
+	}
+	assert.Equal(t, 1, registryCalls, "an unknown DID must be remembered, not re-fetched per request")
 }
