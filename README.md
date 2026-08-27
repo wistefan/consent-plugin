@@ -228,6 +228,9 @@ Collector for the audit log:
 | `upstream` | echo service standing in for the personal-data API | — |
 | `otel-collector` | receives the access-decision audit log | `4318` |
 
+The runner also serves Prometheus metrics on `9091` (`CONSENT_METRICS_ADDRESS` is
+set for it in the compose file).
+
 Then create the gated route:
 
 ```bash

@@ -1,13 +1,27 @@
 {
-  "//": "POST /resolve — the OwnerResolver. It answers from the DATA who the owner is; here it always reports the same owner so the stack has a working happy path.",
-  "request": { "method": "POST", "url": "/resolve" },
+  "name": "owner resolver",
+  "metadata": {
+    "comment": "POST /resolve - the OwnerResolver. It answers from the DATA who the owner is; here it always reports the same owner so the stack has a working happy path."
+  },
+  "request": {
+    "method": "POST",
+    "url": "/resolve"
+  },
   "response": {
     "status": 200,
-    "headers": { "Content-Type": "application/json" },
+    "headers": {
+      "Content-Type": "application/json"
+    },
     "jsonBody": {
       "consentRequired": true,
       "claims": [
-        { "selector": { "type": "jsonpath", "value": "$.id" }, "ownerId": "did:key:zDevOwner" }
+        {
+          "selector": {
+            "type": "jsonpath",
+            "value": "$.id"
+          },
+          "ownerId": "did:key:zDevOwner"
+        }
       ]
     }
   }

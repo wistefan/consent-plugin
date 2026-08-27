@@ -1,15 +1,24 @@
 {
-  "//": "GET /consents/participants/{id}?receipt=true — the owner's consents. Granted TO dev-consumer, which is what makes the check pass; change the consumer here to watch the gate deny.",
-  "request": { "method": "GET", "urlPathPattern": "/v1/consents/participants/.*" },
+  "name": "owner consents",
+  "metadata": {
+    "comment": "GET /consents/participants/{id}?receipt=true - the owner's consents. Granted TO dev-consumer, which is what makes the check pass; change the consumer here, or the status to revoked, to watch the gate deny."
+  },
+  "request": {
+    "method": "GET",
+    "urlPathPattern": "/v1/consents/participants/.*"
+  },
   "response": {
     "status": 200,
-    "headers": { "Content-Type": "application/json" },
+    "headers": {
+      "Content-Type": "application/json"
+    },
     "jsonBody": {
       "consents": [
         {
           "status": "granted",
-          "consumer": { "selfDescriptionURL": "http://mock:8080/participants/dev-consumer" },
-          "data": [{ "resource": "http://mock:8080/resources/personal-profile" }]
+          "consumer": {
+            "selfDescriptionURL": "http://mock:8080/participants/dev-consumer"
+          }
         }
       ]
     }

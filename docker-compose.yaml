@@ -14,13 +14,17 @@
 # before either process can bind, and the runner then fails to start.
 
 services:
+  # The upstream etcd image rather than bitnami/etcd, which was retired from the
+  # public catalog and no longer resolves — `docker compose up` failed on the
+  # pull. This one needs no auth-disabling env var: it is open by default, which
+  # is fine for a local stack and is not a deployment example.
   etcd:
-    image: bitnami/etcd:3.5
-    environment:
-      ETCD_ENABLE_V2: "true"
-      ALLOW_NONE_AUTHENTICATION: "yes"
-      ETCD_ADVERTISE_CLIENT_URLS: "http://etcd:2379"
-      ETCD_LISTEN_CLIENT_URLS: "http://0.0.0.0:2379"
+    image: quay.io/coreos/etcd:v3.5.17
+    command:
+      - etcd
+      - --name=etcd0
+      - --advertise-client-urls=http://etcd:2379
+      - --listen-client-urls=http://0.0.0.0:2379
     ports:
       - "2379:2379"
 
@@ -54,6 +58,8 @@ services:
     depends_on:
       socket-init:
         condition: service_completed_successfully
+      mock:
+        condition: service_healthy
     volumes:
       - runner-socket:/opt/runner
     environment:
@@ -63,6 +69,10 @@ services:
       CONSENT_KEY: "dev-consent-key"
       CONSENT_TOKEN_SERVICE_URL: "http://mock:8080/internal/tokens"
       CONSENT_AUDIT_OTLP_ENDPOINT: "http://otel-collector:4318"
+      # Prometheus metrics, off unless an address is set.
+      CONSENT_METRICS_ADDRESS: ":9091"
+    ports:
+      - "9091:9091"   # Prometheus metrics
     restart: on-failure
 
   # Mock consent-manager, OwnerResolver and participant token service. The
@@ -74,6 +84,15 @@ services:
       - ./dev/mocks:/home/wiremock/mappings:ro
     ports:
       - "8081:8080"
+    # A malformed stub makes WireMock exit at startup, and without a healthcheck
+    # that shows up only as an unexplained deny from the gate several steps
+    # later. Depending services wait for this instead.
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/__admin/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
 
   # The upstream whose responses are gated. It echoes the request back as JSON,
   # which is enough for the OwnerResolver stub to be asked about a payload.

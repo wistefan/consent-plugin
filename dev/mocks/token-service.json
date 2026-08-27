@@ -1,9 +1,21 @@
 {
-  "//": "The participant-local OID4VP token service (the consent-facade's POST /internal/tokens). It mints the short-lived participant token the plugin uses for the consents lookup.",
-  "request": { "method": "POST", "url": "/internal/tokens" },
+  "name": "participant token service",
+  "metadata": {
+    "comment": "The participant-local OID4VP token service (the consent-facade's POST /internal/tokens). It mints the short-lived participant token the plugin uses for the consents lookup."
+  },
+  "request": {
+    "method": "POST",
+    "url": "/internal/tokens"
+  },
   "response": {
     "status": 200,
-    "headers": { "Content-Type": "application/json" },
-    "jsonBody": { "access_token": "dev-participant-token", "token_type": "Bearer", "expires_in": 3600 }
+    "headers": {
+      "Content-Type": "application/json"
+    },
+    "jsonBody": {
+      "access_token": "dev-participant-token",
+      "token_type": "Bearer",
+      "expires_in": 3600
+    }
   }
 }
