@@ -1,3 +1,20 @@
+/*
+ * Copyright 2026 Seamless Middleware Technologies S.L and/or its affiliates
+ * and other contributors as indicated by the @author tags.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 // Package integration provides end-to-end integration tests for the
 // consent-filter plugin. Each test starts a mock consent API server,
 // creates a real plugin instance with configuration pointing to it,
@@ -406,17 +423,21 @@ func TestIntegration_ContextCleanupAfterCycle(t *testing.T) {
 
 // newConsentManagerCC starts a mock consent-manager exposing all four endpoints
 // used by the client-credentials flow (login, me, identifier search, consents).
-func newConsentManagerCC(t *testing.T, wantSubject, userID, selfDescriptionURL string, statuses []string) *httptest.Server {
+func newConsentManagerTokenService(t *testing.T, wantSubject, userID, selfDescriptionURL string, statuses []string) *httptest.Server {
 	t.Helper()
 	mux := http.NewServeMux()
 
-	mux.HandleFunc("/v1/participants/login", func(w http.ResponseWriter, r *http.Request) {
+	// The participant-local token service (the consent-facade's /internal/tokens),
+	// served on the same test server for convenience. The plugin holds no
+	// participant credentials - it asks for a token by audience NAME.
+	mux.HandleFunc("/internal/tokens", func(w http.ResponseWriter, r *http.Request) {
 		var b map[string]string
 		_ = json.NewDecoder(r.Body).Decode(&b)
-		assert.Equal(t, "consent-demo-provider", b["clientID"])
-		assert.Equal(t, "demo", b["clientSecret"])
+		assert.Equal(t, "consent-manager", b["audience"])
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "jwt": "itest-token"})
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"access_token": "itest-token", "token_type": "Bearer", "expires_in": 3600,
+		})
 	})
 
 	mux.HandleFunc("/v1/participants/me", func(w http.ResponseWriter, r *http.Request) {
@@ -456,37 +477,37 @@ func newConsentManagerCC(t *testing.T, wantSubject, userID, selfDescriptionURL s
 
 // ccConfig is a plugin config using participant client credentials (no static
 // token, no explicit provider_sd — both are obtained from the consent-manager).
-func ccConfig(consentURL string) map[string]interface{} {
+func tokenServiceConfig(consentURL string) map[string]interface{} {
 	return map[string]interface{}{
 		"consent_api_url":       consentURL,
 		"consent_key":           "itest-consent-key",
-		"client_id":             "consent-demo-provider",
-		"client_secret":         "demo",
+		"token_service_url":     consentURL + "/internal/tokens",
 		"jwt_claims_to_forward": []string{"sub"},
 	}
 }
 
-// TestIntegration_ClientCredentialsFlow drives the full client-credentials path:
-// login for a token, derive the provider SD from /me, then the two-call check.
-func TestIntegration_ClientCredentialsFlow(t *testing.T) {
-	srv := newConsentManagerCC(t, "did:key:zAlice", "uid-1",
+// TestIntegration_TokenServiceFlow drives the full OID4VP-token path: fetch a
+// token from the participant-local token service, derive the provider SD from
+// /me, then the two-call check.
+func TestIntegration_TokenServiceFlow(t *testing.T) {
+	srv := newConsentManagerTokenService(t, "did:key:zAlice", "uid-1",
 		"http://consent-facade:8080/participants/derived", []string{"granted"})
 	defer srv.Close()
 
-	resp := runPluginCycle(t, marshalConfig(t, ccConfig(srv.URL)),
+	resp := runPluginCycle(t, marshalConfig(t, tokenServiceConfig(srv.URL)),
 		consentRequest(20, "did:key:zAlice"), []byte(`{"ok":true}`))
 
 	assert.Nil(t, resp.writtenBody, "granted consent via client credentials should pass through")
 }
 
-// TestIntegration_ClientCredentialsDenied verifies a not-granted consent denies
-// via the client-credentials path.
-func TestIntegration_ClientCredentialsDenied(t *testing.T) {
-	srv := newConsentManagerCC(t, "", "uid-1",
+// TestIntegration_TokenServiceDenied verifies a not-granted consent denies via
+// the OID4VP-token path.
+func TestIntegration_TokenServiceDenied(t *testing.T) {
+	srv := newConsentManagerTokenService(t, "", "uid-1",
 		"http://consent-facade:8080/participants/derived", []string{"revoked"})
 	defer srv.Close()
 
-	resp := runPluginCycle(t, marshalConfig(t, ccConfig(srv.URL)),
+	resp := runPluginCycle(t, marshalConfig(t, tokenServiceConfig(srv.URL)),
 		consentRequest(21, "did:key:zAlice"), []byte(`{"secret":"x"}`))
 
 	assert.Equal(t, 403, resp.writtenStatus)

@@ -1,5 +1,6 @@
 # CI pipeline for consent-plugin.
-# Runs on every push and pull request: lint, test with coverage, and build.
+# Runs on every push and pull request: copyright headers, lint, test with
+# coverage, and build.
 
 name: CI
 
@@ -22,6 +23,9 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+
+      - name: Verify copyright headers
+        run: ./hack/license-header.sh check
 
       - name: Install golangci-lint
         uses: golangci/golangci-lint-action@v6

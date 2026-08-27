@@ -31,11 +31,27 @@ pre-release so the change can be deployed and tested before merge.
 
 Merging without a semver label runs the pipeline but produces no release.
 
+## Copyright headers
+
+Every Go source file must carry the Apache-2.0 copyright header. The canonical text lives in
+[`hack/license-header.txt`](hack/license-header.txt) - edit it there and nowhere else.
+
+```bash
+make license-check   # verify (what CI runs)
+make license-fix     # add the header to files that lack it
+```
+
+CI enforces this on pull requests and on pushes to `main`, and gates both the pre-release and the
+release on it, so a version can never ship a file without the header. The Gitea pipeline
+(`.gitea/workflows/ci.yaml`) runs the same check. It covers `*.go` only: the header is a `/* */`
+block, which is not valid comment syntax in the Dockerfile or the Makefile.
+
 ## Local checks
 
 Run the same gates locally before opening a PR:
 
 ```bash
+make license-check # copyright headers
 make lint          # golangci-lint
 make test          # unit + integration tests (race)
 make build         # compile the go-runner

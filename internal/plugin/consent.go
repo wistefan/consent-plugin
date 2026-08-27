@@ -1,3 +1,20 @@
+/*
+ * Copyright 2026 Seamless Middleware Technologies S.L and/or its affiliates
+ * and other contributors as indicated by the @author tags.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 // Package plugin implements the APISIX consent-filter plugin that intercepts
 // HTTP responses and applies consent-based filtering for personal data.
 package plugin
@@ -6,9 +23,11 @@ import (
 	"consent-plugin/internal/audit"
 	"consent-plugin/internal/consent"
 	"consent-plugin/internal/jwt"
+	"consent-plugin/internal/ownerresolver"
 	"context"
 	"log"
 	"net/http"
+	"strings"
 	"time"
 
 	pkgHTTP "github.com/apache/apisix-go-plugin-runner/pkg/http"
@@ -104,7 +123,7 @@ func (c *ConsentFilter) RequestFilter(conf interface{}, w http.ResponseWriter, r
 			log.Printf("[consent-filter] RequestFilter: failed to extract JWT from header %q for request %d: %v",
 				cfg.JWTHeaderName, r.ID(), err)
 		} else {
-			claims, err := jwt.DecodeClaims(token, cfg.JWTClaimsToForward)
+			claims, err := jwt.DecodeClaims(token, claimKeysToDecode(cfg))
 			if err != nil {
 				log.Printf("[consent-filter] RequestFilter: failed to decode JWT claims for request %d: %v",
 					r.ID(), err)
@@ -194,37 +213,152 @@ func (c *ConsentFilter) evaluate(cfg *Config, w pkgHTTP.Response) responseOutcom
 		return failOutcome(cfg, "no request context", key, nil)
 	}
 
-	// Run the two-call consent check for the request subject.
-	consentReq := buildConsentRequest(reqCtx)
-	consentClient := consent.NewClient(consent.ClientConfig{
-		BaseURL:          cfg.ConsentAPIURL,
-		APIPrefix:        cfg.ConsentAPIPrefix,
-		ConsentKey:       cfg.ConsentKey,
-		ProviderSD:       cfg.ProviderSD,
-		ParticipantToken: cfg.ParticipantToken,
-		ClientID:         cfg.ClientID,
-		ClientSecret:     cfg.ClientSecret,
-		TokenTTL:         time.Duration(cfg.ParticipantTokenTTL) * time.Second,
-		TimeoutMs:        cfg.ConsentAPITimeout,
-	})
-	consentResp, err := consentClient.CheckConsent(context.Background(), consentReq)
-	if err != nil {
-		log.Printf("[consent-filter] ResponseFilter: consent check error for request %d: %v", w.ID(), err)
-		return failOutcome(cfg, "consent check error: "+err.Error(), key, &consentReq)
+	consentClient := consent.NewClient(clientConfigFromCfg(cfg))
+
+	// Owner-resolver mode: resolve the data owner(s) from the response DATA and
+	// check consent per owner (never the requestor). Falls back to the legacy
+	// JWT-subject mode when no resolver is configured.
+	if cfg.OwnerResolverURL != "" {
+		return c.evaluateWithResolver(cfg, w, key, reqCtx, consentClient)
 	}
 
+	consentReq := buildConsentRequest(reqCtx)
+	return checkConsent(cfg, key, consentClient, consentReq)
+}
+
+// evaluateWithResolver reads the upstream body, asks the OwnerResolver who owns
+// the data (and whether consent is required), and enforces deny_all: every
+// distinct (owner, dataResource) claim must have a granted consent, or the whole
+// response is denied. The requestor identity is never consulted.
+func (c *ConsentFilter) evaluateWithResolver(cfg *Config, w pkgHTTP.Response, key string, reqCtx *RequestContext, consentClient *consent.Client) responseOutcome {
+	body, err := w.ReadBody()
+	if err != nil {
+		log.Printf("[consent-filter] ResponseFilter: could not read upstream body for request %s: %v", key, err)
+		return failOutcome(cfg, "read upstream body: "+err.Error(), key, nil)
+	}
+
+	contentType := ""
+	if h := w.Header(); h != nil {
+		contentType = h.Get("Content-Type")
+	}
+
+	resolverClient := ownerresolver.NewClient(cfg.OwnerResolverURL, cfg.OwnerResolverTimeout)
+	// Parties are for CONTRACT identification only - never for ownership. The
+	// token names the consumer by DID, while contracts name their parties by
+	// self-description URL, so translate it via the participant registry.
+	resolveParties := ownerresolver.Parties{}
+	if consumerDID := consumerFromClaims(reqCtx.JWTClaims, cfg.ConsumerClaim); consumerDID != "" {
+		if consumerSD, sdErr := consentClient.ParticipantSelfDescriptionByDID(context.Background(), consumerDID); sdErr != nil {
+			log.Printf("[consent-filter] ResponseFilter: could not map consumer did %q to a participant for request %s: %v", consumerDID, key, sdErr)
+		} else {
+			resolveParties.Consumer = consumerSD
+		}
+	}
+	if providerSD, sdErr := consentClient.ProviderSelfDescription(context.Background()); sdErr != nil {
+		log.Printf("[consent-filter] ResponseFilter: could not determine the provider self-description for request %s: %v", key, sdErr)
+	} else {
+		resolveParties.Provider = providerSD
+	}
+	result, err := resolverClient.Resolve(context.Background(), ownerresolver.Resource{
+		Service:     cfg.Service,
+		Method:      reqCtx.Method,
+		Path:        reqCtx.Path,
+		ContentType: contentType,
+	}, resolveParties, body)
+	if err != nil {
+		log.Printf("[consent-filter] ResponseFilter: owner resolver error for request %s: %v", key, err)
+		return failOutcome(cfg, "owner resolver error: "+err.Error(), key, nil)
+	}
+
+	if !result.ConsentRequired {
+		return responseOutcome{decision: decisionAllow, reason: "no consent required", requestID: key, resource: reqCtx.Path, method: reqCtx.Method}
+	}
+	if len(result.Claims) == 0 {
+		// Consent required but no owner could be resolved — fail closed.
+		return failOutcome(cfg, "consent required but no data owner resolved", key, nil)
+	}
+
+	// deny_all: every distinct (owner, dataResource) claim must be granted.
+	type pair struct{ owner, resource string }
+	checked := make(map[pair]bool)
+	for _, claim := range result.Claims {
+		if claim.OwnerID == "" {
+			return failOutcome(cfg, "resolved claim without a data owner", key, nil)
+		}
+		p := pair{owner: claim.OwnerID, resource: claim.DataResource}
+		if checked[p] {
+			continue
+		}
+		checked[p] = true
+
+		req := consent.ConsentRequest{
+			Subject:      claim.OwnerID,
+			Resource:     reqCtx.Path,
+			Method:       reqCtx.Method,
+			DataResource: claim.DataResource,
+		}
+		resp, err := consentClient.CheckConsent(context.Background(), req)
+		if err != nil {
+			log.Printf("[consent-filter] ResponseFilter: consent check error for request %s: %v", key, err)
+			return failOutcome(cfg, "consent check error: "+err.Error(), key, &req)
+		}
+		if resp.Decision != consent.DecisionAllow {
+			return responseOutcome{
+				decision:  decisionDeny,
+				reason:    resp.Reason,
+				requestID: key,
+				subject:   claim.OwnerID,
+				resource:  resourceOrPath(claim.DataResource, reqCtx.Path),
+				method:    reqCtx.Method,
+			}
+		}
+	}
+	return responseOutcome{decision: decisionAllow, requestID: key, resource: reqCtx.Path, method: reqCtx.Method}
+}
+
+// checkConsent runs a single consent check and maps it to an outcome (legacy
+// JWT-subject mode).
+func checkConsent(cfg *Config, key string, client *consent.Client, req consent.ConsentRequest) responseOutcome {
+	resp, err := client.CheckConsent(context.Background(), req)
+	if err != nil {
+		return failOutcome(cfg, "consent check error: "+err.Error(), key, &req)
+	}
 	decision := decisionDeny
-	if consentResp.Decision == consent.DecisionAllow {
+	if resp.Decision == consent.DecisionAllow {
 		decision = decisionAllow
 	}
 	return responseOutcome{
 		decision:  decision,
-		reason:    consentResp.Reason,
+		reason:    resp.Reason,
 		requestID: key,
-		subject:   consentReq.Subject,
-		resource:  consentReq.Resource,
-		method:    consentReq.Method,
+		subject:   req.Subject,
+		resource:  req.Resource,
+		method:    req.Method,
 	}
+}
+
+// clientConfigFromCfg builds the consent-manager client config from the plugin config.
+func clientConfigFromCfg(cfg *Config) consent.ClientConfig {
+	return consent.ClientConfig{
+		BaseURL:          cfg.ConsentAPIURL,
+		Host:             cfg.ConsentAPIHost,
+		APIPrefix:        cfg.ConsentAPIPrefix,
+		ConsentKey:       cfg.ConsentKey,
+		ProviderSD:       cfg.ProviderSD,
+		ParticipantToken: cfg.ParticipantToken,
+		TokenServiceURL:  cfg.TokenServiceURL,
+		TokenAudience:    cfg.TokenAudience,
+		TokenTTL:         time.Duration(cfg.ParticipantTokenTTL) * time.Second,
+		TimeoutMs:        cfg.ConsentAPITimeout,
+	}
+}
+
+// resourceOrPath returns dataResource when set, else the request path (for audit).
+func resourceOrPath(dataResource, path string) string {
+	if dataResource != "" {
+		return dataResource
+	}
+	return path
 }
 
 // failOutcome builds the outcome for an unresolved consent check, applying the
@@ -294,4 +428,53 @@ func denyResponse(w pkgHTTP.Response, cfg *Config) {
 	if _, err := w.Write([]byte(cfg.DenyResponseBody)); err != nil {
 		log.Printf("[consent-filter] ResponseFilter: failed to write deny body for request %d: %v", w.ID(), err)
 	}
+}
+
+// claimKeysToDecode returns the claim keys the request phase must decode: the
+// configured forward list plus the root of the consumer-claim path, so the
+// consumer can be read in the response phase. An empty result means "all claims".
+func claimKeysToDecode(cfg *Config) []string {
+	if len(cfg.JWTClaimsToForward) == 0 {
+		// DecodeClaims returns every claim in this case - nothing to add.
+		return nil
+	}
+	keys := append([]string(nil), cfg.JWTClaimsToForward...)
+	if cfg.ConsumerClaim == "" {
+		return keys
+	}
+	root := strings.SplitN(cfg.ConsumerClaim, claimPathSeparator, 2)[0]
+	for _, k := range keys {
+		if k == root {
+			return keys
+		}
+	}
+	return append(keys, root)
+}
+
+// claimPathSeparator separates the segments of a dotted claim path.
+const claimPathSeparator = "."
+
+// consumerFromClaims reads the consuming participant from a dotted claim path
+// (e.g. "verifiableCredential.issuer"). It returns "" when the path is unset or
+// does not resolve to a string - the resolver then reports that it cannot
+// identify the contract, and the fail policy applies.
+func consumerFromClaims(claims map[string]interface{}, path string) string {
+	if len(claims) == 0 || path == "" {
+		return ""
+	}
+	var current interface{} = claims
+	for _, segment := range strings.Split(path, claimPathSeparator) {
+		node, ok := current.(map[string]interface{})
+		if !ok {
+			return ""
+		}
+		current, ok = node[segment]
+		if !ok {
+			return ""
+		}
+	}
+	if s, ok := current.(string); ok {
+		return s
+	}
+	return ""
 }

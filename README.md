@@ -33,7 +33,7 @@ GET {base}/consents/participants/{userIdentifier}?receipt=true
 Header: Authorization: Bearer <participant_token>
 →      { "consents": [ { "status": "granted" | "revoked" | ... } ] }
 ```
-Access is **allowed** iff at least one returned consent has `status == "granted"`.
+Access is **allowed** if at least one returned consent has `status == "granted"`.
 
 The subject DID is taken from the JWT `sub` claim (so `jwt_claims_to_forward` must include `sub`) and sent as the user `email` (the consent-manager's DID-in-email convention).
 
@@ -190,4 +190,6 @@ Releasing requires the `QUAY_USERNAME` / `QUAY_PASSWORD` repository secrets.
 
 ## License
 
-See [LICENSE](LICENSE) for details.
+Apache-2.0 - see [LICENSE](LICENSE). Every Go source file carries the copyright header from
+[`hack/license-header.txt`](hack/license-header.txt); `make license-check` verifies it and CI enforces
+it on pull requests, on `main`, and as a gate on the pre-release and release.

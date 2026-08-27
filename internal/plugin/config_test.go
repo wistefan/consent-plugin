@@ -1,3 +1,20 @@
+/*
+ * Copyright 2026 Seamless Middleware Technologies S.L and/or its affiliates
+ * and other contributors as indicated by the @author tags.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 package plugin
 
 import (
@@ -217,37 +234,78 @@ func TestParseConfig(t *testing.T) {
 	}
 }
 
-// TestParseConfig_EnvFallback verifies the credential fields fall back to their
-// env vars when omitted from the route config, and that a value in the config
-// always takes precedence over the env var.
+// TestParseConfig_EnvFallback verifies the credential-bearing fields fall back to
+// their env vars when omitted from the route config, and that a value in the
+// config always takes precedence over the env var.
 func TestParseConfig_EnvFallback(t *testing.T) {
-	t.Run("env fills empty credential fields", func(t *testing.T) {
+	t.Run("env fills empty fields", func(t *testing.T) {
 		t.Setenv(EnvConsentKey, "ck-from-env")
-		t.Setenv(EnvClientID, "cid-from-env")
-		t.Setenv(EnvClientSecret, "sec-from-env")
+		t.Setenv(EnvTokenServiceURL, "http://facade-from-env:8080/internal/tokens")
 
 		cfg, err := ParseConfig(toJSON(t, validConfigJSON()))
 		require.NoError(t, err)
 		assert.Equal(t, "ck-from-env", cfg.ConsentKey)
-		assert.Equal(t, "cid-from-env", cfg.ClientID)
-		assert.Equal(t, "sec-from-env", cfg.ClientSecret)
+		assert.Equal(t, "http://facade-from-env:8080/internal/tokens", cfg.TokenServiceURL)
 	})
 
 	t.Run("config values win over env", func(t *testing.T) {
 		t.Setenv(EnvConsentKey, "ck-from-env")
-		t.Setenv(EnvClientID, "cid-from-env")
-		t.Setenv(EnvClientSecret, "sec-from-env")
+		t.Setenv(EnvTokenServiceURL, "http://facade-from-env:8080/internal/tokens")
 
 		in := validConfigJSON()
 		in["consent_key"] = "ck-from-config"
-		in["client_id"] = "cid-from-config"
-		in["client_secret"] = "sec-from-config"
+		in["token_service_url"] = "http://facade-from-config:8080/internal/tokens"
 		cfg, err := ParseConfig(toJSON(t, in))
 		require.NoError(t, err)
 		assert.Equal(t, "ck-from-config", cfg.ConsentKey)
-		assert.Equal(t, "cid-from-config", cfg.ClientID)
-		assert.Equal(t, "sec-from-config", cfg.ClientSecret)
+		assert.Equal(t, "http://facade-from-config:8080/internal/tokens", cfg.TokenServiceURL)
 	})
+}
+
+// TestParseConfig_TokenAudienceDefault verifies the audience defaults to the
+// consent-manager target and that an explicit value is kept.
+func TestParseConfig_TokenAudienceDefault(t *testing.T) {
+	cases := []struct {
+		name       string
+		configured string
+		want       string
+	}{
+		{name: "defaults when omitted", configured: "", want: DefaultTokenAudience},
+		{name: "keeps an explicit audience", configured: "some-other-target", want: "some-other-target"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			in := validConfigJSON()
+			if tc.configured != "" {
+				in["token_audience"] = tc.configured
+			}
+			cfg, err := ParseConfig(toJSON(t, in))
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, cfg.TokenAudience)
+		})
+	}
+}
+
+// TestParseConfig_TokenServiceURLValidation rejects a token service URL that is
+// not an http(s) URL - a typo there would otherwise surface as a failed consent
+// check on the data path.
+func TestParseConfig_TokenServiceURLValidation(t *testing.T) {
+	cases := []struct {
+		name string
+		url  string
+	}{
+		{name: "not a URL", url: "not-a-url"},
+		{name: "wrong scheme", url: "ftp://facade:8080/internal/tokens"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			in := validConfigJSON()
+			in["token_service_url"] = tc.url
+			_, err := ParseConfig(toJSON(t, in))
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "token_service_url")
+		})
+	}
 }
 
 // TestParseConfig_Audit covers the audit config: enabling requires an endpoint,

@@ -1,3 +1,20 @@
+/*
+ * Copyright 2026 Seamless Middleware Technologies S.L and/or its affiliates
+ * and other contributors as indicated by the @author tags.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 // Package consent provides an HTTP client for communicating with an external
 // consent API that determines whether response data should be allowed, denied,
 // or filtered based on consent policies for personal data.
@@ -47,6 +64,11 @@ type ConsentRequest struct {
 
 	// Method is the HTTP method of the original request (e.g., "GET", "POST").
 	Method string `json:"method"`
+
+	// DataResource, when set, scopes the check: a granted consent counts only if
+	// it covers this resource (matched against the consent's data[].resource).
+	// Empty means owner-level (any granted consent counts).
+	DataResource string `json:"data_resource,omitempty"`
 
 	// Claims contains the forwarded JWT claims as key-value pairs.
 	Claims map[string]interface{} `json:"claims,omitempty"`
