@@ -355,6 +355,8 @@ func TestConfig_Validate(t *testing.T) {
 				ConsentAPIURL:           "https://consent.example.com",
 				ConsentAPITimeout:       DefaultConsentAPITimeout,
 				OwnerResolverURL:        "https://owner-resolver.example.com/resolve",
+				ResponsePhaseTimeout:    DefaultResponsePhaseTimeout,
+				MaxOwnersPerResponse:    DefaultMaxOwnersPerResponse,
 				JWTHeaderName:           DefaultJWTHeaderName,
 				DenyStatusCode:          DefaultDenyStatusCode,
 				DenyResponseBody:        DefaultDenyResponseBody,
@@ -373,9 +375,11 @@ func TestConfig_Validate(t *testing.T) {
 		{
 			name: "missing owner_resolver_url fails",
 			config: Config{
-				ConsentAPIURL:     "https://consent.example.com",
-				ConsentAPITimeout: DefaultConsentAPITimeout,
-				DenyStatusCode:    DefaultDenyStatusCode,
+				ConsentAPIURL:        "https://consent.example.com",
+				ConsentAPITimeout:    DefaultConsentAPITimeout,
+				ResponsePhaseTimeout: DefaultResponsePhaseTimeout,
+				MaxOwnersPerResponse: DefaultMaxOwnersPerResponse,
+				DenyStatusCode:       DefaultDenyStatusCode,
 			},
 			wantErr:   true,
 			errSubstr: "owner_resolver_url is required",

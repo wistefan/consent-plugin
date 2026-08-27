@@ -764,3 +764,47 @@ func TestDecodeParticipants(t *testing.T) {
 		})
 	}
 }
+
+// TestResolveUserIdentifier_MemoisedPerSubject verifies the subject ->
+// userIdentifier mapping is reused, so one response resolving to the same owner
+// under several data resources searches once instead of once per resource.
+func TestResolveUserIdentifier_MemoisedPerSubject(t *testing.T) {
+	resetCredCache()
+	m := &mockCM{userID: "uid-1", statuses: []string{"granted"}, resourcesPerConsent: [][]string{{"r1", "r2"}}}
+	srv := newMockCM(t, m)
+	c := NewClient(ClientConfig{BaseURL: srv.URL, ConsentKey: "ck", ParticipantToken: "static", ProviderSD: "sd"})
+
+	for _, resource := range []string{"r1", "r2"} {
+		resp, err := c.CheckConsent(context.Background(),
+			ConsentRequest{Subject: "did:key:zOwner", Consumer: testConsumerSD, DataResource: resource})
+		require.NoError(t, err)
+		assert.Equal(t, DecisionAllow, resp.Decision)
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	assert.Equal(t, 1, m.searchCalls, "the same owner must be resolved to an identifier once")
+	assert.Equal(t, 2, m.consentsCalls, "each resource still needs its own consent decision")
+}
+
+// TestResolveUserIdentifier_UnknownSubjectNotCached verifies an unknown subject
+// is re-asked every time. A data subject can register at any moment, and
+// remembering that they were unknown would keep denying them after they had
+// consented.
+func TestResolveUserIdentifier_UnknownSubjectNotCached(t *testing.T) {
+	resetCredCache()
+	m := &mockCM{userID: "", statuses: nil}
+	srv := newMockCM(t, m)
+	c := NewClient(ClientConfig{BaseURL: srv.URL, ConsentKey: "ck", ParticipantToken: "static", ProviderSD: "sd"})
+
+	for i := 0; i < 3; i++ {
+		resp, err := c.CheckConsent(context.Background(),
+			ConsentRequest{Subject: "did:key:zStranger", Consumer: testConsumerSD})
+		require.NoError(t, err)
+		assert.Equal(t, DecisionDeny, resp.Decision)
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	assert.Equal(t, 3, m.searchCalls, "an unknown subject must not be cached as unknown")
+}

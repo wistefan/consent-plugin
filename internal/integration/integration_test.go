@@ -718,7 +718,8 @@ func TestIntegration_Resolver(t *testing.T) {
 			resolverReply: resolveReply(ownerAlice, ownerBob),
 			statusByOwner: map[string]string{ownerAlice: "granted", ownerBob: "revoked"},
 			wantDenied:    true,
-			wantOwners:    []string{ownerAlice, ownerBob},
+			// Which owners get asked depends on the concurrent short-circuit, so
+			// only the decision is asserted here.
 		},
 		{
 			name:          "an owner unknown to the consent-manager denies",
@@ -804,7 +805,8 @@ func TestIntegration_Resolver(t *testing.T) {
 				assert.Equal(t, 0, resp.writtenStatus)
 			}
 			if tt.wantOwners != nil {
-				assert.Equal(t, tt.wantOwners, asked, "the consent-manager must be asked about exactly these owners")
+				// Checks run concurrently, so the order is not significant.
+				assert.ElementsMatch(t, tt.wantOwners, asked, "the consent-manager must be asked about exactly these owners")
 			}
 		})
 	}

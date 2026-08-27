@@ -35,7 +35,11 @@ participant** for the contract lookup and to scope the consent match.
 before the runner sees it (`ReadBody()` is a blocking extra-info RPC over the
 unix socket). Gated routes therefore do not stream, and a large response is a
 memory multiplier across APISIX and the runner. Keep gated routes to bounded
-responses.
+responses, and note that `response_phase_timeout` and `max_owners_per_response`
+(below) bound how long the response is held and how many owners are checked.
+
+Per-owner consent checks run concurrently (up to 8 in flight) and short-circuit
+on the first denial, so latency is not the sum over owners.
 
 ## The two-call consent check
 
@@ -102,6 +106,8 @@ Configured via the APISIX route plugin JSON (identically on both `ext-plugin-pre
 | `owner_resolver_url` | `string` | **Yes** | — | The OwnerResolver `/resolve` endpoint. The data owner is resolved from the response payload; without it the plugin cannot determine whose consent to check, so the route fails to load. `http`/`https` only. |
 | `owner_resolver_timeout` | `int` | No | `2000` | Per-call timeout in ms for `/resolve`. Range 1–60000. |
 | `service` | `string` | No | — | Logical dataset id sent to the OwnerResolver as `resource.service`, so it can select the rule for this route. |
+| `response_phase_timeout` | `int` | No | `10000` | Budget in ms for the **entire** response phase — party lookups, `/resolve`, and every per-owner consent check together. APISIX holds the buffered response for this whole time, so it is bounded independently of the per-call timeouts. Range 1–120000. |
+| `max_owners_per_response` | `int` | No | `50` | Maximum distinct data owners checked for one response. A response resolving to more is denied rather than answered after an unbounded number of consent calls. Range 1–1000. |
 | `consumer_claim` | `string` | No | `verifiableCredential.issuer` | Dotted claim path naming the **consuming participant**. Used for the contract lookup and to scope the consent match — never for ownership. |
 | `consent_api_prefix` | `string` | No | `/v1` | API prefix prepended to endpoint paths (the consent-manager's `API_PREFIX`). Must start with `/`. |
 | `consent_api_host` | `string` | No | — | Overrides the HTTP `Host` header on consent-manager calls. Needed when `consent_api_url` points at an in-cluster service whose gateway route is host-scoped to the public ingress name. |

@@ -18,11 +18,14 @@
 package plugin
 
 import (
+	"consent-plugin/internal/ownerresolver"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
 	"testing"
+	"time"
 
 	pkgHTTP "github.com/apache/apisix-go-plugin-runner/pkg/http"
 	"github.com/stretchr/testify/assert"
@@ -279,6 +282,8 @@ func newTestConfig(consentAPIURL, resolverURL string) *Config {
 		ConsentAPITimeout:       DefaultConsentAPITimeout,
 		OwnerResolverURL:        resolverURL,
 		OwnerResolverTimeout:    DefaultOwnerResolverTimeout,
+		ResponsePhaseTimeout:    DefaultResponsePhaseTimeout,
+		MaxOwnersPerResponse:    DefaultMaxOwnersPerResponse,
 		ConsumerClaim:           DefaultConsumerClaim,
 		JWTHeaderName:           DefaultJWTHeaderName,
 		ConsentKey:              "test-consent-key",
@@ -703,4 +708,120 @@ func TestResponseFilter_OwnerNotRequestor(t *testing.T) {
 		"consent must be checked for the resolved data owner, never for the token subject")
 	assert.Equal(t, DefaultDenyStatusCode, resp.writtenStatus,
 		"the owner has no granted consent, so the caller's own consent must not unlock the data")
+}
+
+// TestResponseFilter_OwnerCapDenies verifies a response resolving to more data
+// owners than the cap is denied outright, rather than answered after an
+// unbounded number of consent calls. A collection endpoint returning hundreds of
+// entities is otherwise a latency and load amplifier any caller can trigger.
+func TestResponseFilter_OwnerCapDenies(t *testing.T) {
+	clearContextStore()
+
+	owners := make([]string, 0, 5)
+	for i := 0; i < 5; i++ {
+		owners = append(owners, fmt.Sprintf("did:key:zOwner%d", i))
+	}
+
+	server := newUncalledConsentManager(t)
+	defer server.Close()
+	resolver := newOwnerResolver(t, ownedBy(owners...))
+	defer resolver.Close()
+
+	cfg := newTestConfig(server.URL, resolver.URL+"/resolve")
+	cfg.MaxOwnersPerResponse = 3
+	// Even with fail_open the cap must deny: it is a deliberate limit, not an outage.
+	cfg.FailOpen = boolPtr(true)
+
+	const id = uint32(210)
+	storeRequest(id)
+	resp := newMockResponse(id, []byte(`{}`))
+	(&ConsentFilter{}).ResponseFilter(cfg, resp)
+
+	assert.Equal(t, DefaultDenyStatusCode, resp.writtenStatus,
+		"more owners than the cap must deny without running the checks")
+}
+
+// TestResponseFilter_ResponsePhaseDeadline verifies the whole response phase is
+// bounded: a consent-manager that never answers must not let APISIX hold the
+// buffered response for per-call-timeout x owner-count.
+func TestResponseFilter_ResponsePhaseDeadline(t *testing.T) {
+	clearContextStore()
+
+	// The consent-manager never answers, so the phase budget is the only thing
+	// that can end the wait.
+	release := make(chan struct{})
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/participants", participantRegistryHandler)
+	mux.HandleFunc("/", func(_ http.ResponseWriter, r *http.Request) {
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	})
+	server := httptest.NewServer(mux)
+	// Releasing the handlers must happen BEFORE Close, which waits for them.
+	defer server.Close()
+	defer close(release)
+
+	resolver := newOwnerResolver(t, ownedBy("did:key:zA", "did:key:zB", "did:key:zC"))
+	defer resolver.Close()
+
+	cfg := newTestConfig(server.URL, resolver.URL+"/resolve")
+	cfg.ResponsePhaseTimeout = 150
+	cfg.ConsentAPITimeout = 60000 // far beyond the phase budget, so the phase budget must win
+
+	const id = uint32(211)
+	storeRequest(id)
+	resp := newMockResponse(id, []byte(`{}`))
+
+	start := time.Now()
+	(&ConsentFilter{}).ResponseFilter(cfg, resp)
+	elapsed := time.Since(start)
+
+	assert.Less(t, elapsed, 5*time.Second, "the response phase must be bounded by response_phase_timeout")
+	assert.Equal(t, DefaultDenyStatusCode, resp.writtenStatus, "a timed-out phase must fail closed by default")
+}
+
+// TestDistinctClaims verifies the resolver's claims collapse to the distinct
+// (owner, dataResource) pairs that actually need checking, in resolver order.
+func TestDistinctClaims(t *testing.T) {
+	tests := []struct {
+		name    string
+		claims  []ownerresolver.Claim
+		want    []ownerClaim
+		wantErr bool
+	}{
+		{
+			name:   "duplicates collapse",
+			claims: []ownerresolver.Claim{{OwnerID: "a"}, {OwnerID: "a"}, {OwnerID: "b"}},
+			want:   []ownerClaim{{owner: "a"}, {owner: "b"}},
+		},
+		{
+			name:   "same owner with different resources stays distinct",
+			claims: []ownerresolver.Claim{{OwnerID: "a", DataResource: "r1"}, {OwnerID: "a", DataResource: "r2"}},
+			want:   []ownerClaim{{owner: "a", dataResource: "r1"}, {owner: "a", dataResource: "r2"}},
+		},
+		{
+			name:   "the purpose is carried through",
+			claims: []ownerresolver.Claim{{OwnerID: "a", Purpose: "p1"}},
+			want:   []ownerClaim{{owner: "a", purpose: "p1"}},
+		},
+		{
+			name:    "a claim without an owner is an error",
+			claims:  []ownerresolver.Claim{{OwnerID: "a"}, {OwnerID: ""}},
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := distinctClaims(tt.claims)
+			if tt.wantErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, got)
+		})
+	}
 }

@@ -26,9 +26,11 @@ import (
 	"consent-plugin/internal/ownerresolver"
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	pkgHTTP "github.com/apache/apisix-go-plugin-runner/pkg/http"
@@ -228,6 +230,13 @@ func (c *ConsentFilter) evaluate(cfg *Config, w pkgHTTP.Response) responseOutcom
 // distinct (owner, dataResource) claim must have a granted consent, or the whole
 // response is denied. The requestor identity is never consulted for ownership.
 func (c *ConsentFilter) evaluateWithResolver(cfg *Config, w pkgHTTP.Response, key string, reqCtx *RequestContext, consentClient *consent.Client) responseOutcome {
+	// One deadline for the whole phase. Every call below derives from it, so the
+	// total time APISIX holds the buffered response is bounded no matter how many
+	// owners the payload resolves to, and a client that has already given up
+	// cancels the work rather than leaving it running against the dependencies.
+	phaseCtx, cancelPhase := context.WithTimeout(context.Background(), time.Duration(cfg.ResponsePhaseTimeout)*time.Millisecond)
+	defer cancelPhase()
+
 	body, err := w.ReadBody()
 	if err != nil {
 		log.Printf("[consent-filter] ResponseFilter: could not read upstream body for request %s: %v", key, err)
@@ -255,7 +264,7 @@ func (c *ConsentFilter) evaluateWithResolver(cfg *Config, w pkgHTTP.Response, ke
 		log.Printf("[consent-filter] ResponseFilter: no consuming participant in the token claims (path %q) for request %s", cfg.ConsumerClaim, key)
 		return failOutcome(cfg, failAlwaysClosed, "no consuming participant identified", key, nil)
 	}
-	consumerSD, sdErr := consentClient.ParticipantSelfDescriptionByDID(context.Background(), consumerDID)
+	consumerSD, sdErr := consentClient.ParticipantSelfDescriptionByDID(phaseCtx, consumerDID)
 	if sdErr != nil {
 		log.Printf("[consent-filter] ResponseFilter: could not map the consumer to a participant for request %s: %v", key, sdErr)
 		return failOutcome(cfg, failModeForError(sdErr), "consumer participant lookup failed: "+sdErr.Error(), key, nil)
@@ -265,7 +274,7 @@ func (c *ConsentFilter) evaluateWithResolver(cfg *Config, w pkgHTTP.Response, ke
 	// on the strength of it would authorise an agreement the subject never made.
 	resolveParties.Consumer = consumerSD
 
-	providerSD, sdErr := consentClient.ProviderSelfDescription(context.Background())
+	providerSD, sdErr := consentClient.ProviderSelfDescription(phaseCtx)
 	if sdErr != nil {
 		log.Printf("[consent-filter] ResponseFilter: could not determine the provider self-description for request %s: %v", key, sdErr)
 		return failOutcome(cfg, failModeForError(sdErr), "provider self-description lookup failed: "+sdErr.Error(), key, nil)
@@ -273,7 +282,7 @@ func (c *ConsentFilter) evaluateWithResolver(cfg *Config, w pkgHTTP.Response, ke
 	resolveParties.Provider = providerSD
 
 	resolverClient := ownerresolver.NewClient(cfg.OwnerResolverURL, cfg.OwnerResolverTimeout)
-	result, err := resolverClient.Resolve(context.Background(), ownerresolver.Resource{
+	result, err := resolverClient.Resolve(phaseCtx, ownerresolver.Resource{
 		Service:     cfg.Service,
 		Method:      reqCtx.Method,
 		Path:        reqCtx.Path,
@@ -292,42 +301,142 @@ func (c *ConsentFilter) evaluateWithResolver(cfg *Config, w pkgHTTP.Response, ke
 		return failOutcome(cfg, failAlwaysClosed, "consent required but no data owner resolved", key, nil)
 	}
 
-	// deny_all: every distinct (owner, dataResource) claim must be granted.
+	claims, err := distinctClaims(result.Claims)
+	if err != nil {
+		return failOutcome(cfg, failAlwaysClosed, err.Error(), key, nil)
+	}
+	if len(claims) > cfg.MaxOwnersPerResponse {
+		log.Printf("[consent-filter] ResponseFilter: %d distinct data owners for request %s exceeds max_owners_per_response=%d; denying",
+			len(claims), key, cfg.MaxOwnersPerResponse)
+		return failOutcome(cfg, failAlwaysClosed,
+			fmt.Sprintf("response resolves to %d data owners, above max_owners_per_response=%d", len(claims), cfg.MaxOwnersPerResponse),
+			key, nil)
+	}
+
+	return checkOwners(phaseCtx, cfg, key, reqCtx, consentClient, claims, consumerSD)
+}
+
+// ownerClaim is one distinct (owner, dataResource) pair to check.
+type ownerClaim struct {
+	owner        string
+	dataResource string
+	purpose      string
+}
+
+// distinctClaims collapses the resolver's claims to the distinct
+// (owner, dataResource) pairs that must be checked, preserving the resolver's
+// order so the reported denial is stable. A claim naming no owner is an error:
+// the resolver said consent is required but not whose.
+func distinctClaims(claims []ownerresolver.Claim) ([]ownerClaim, error) {
 	type pair struct{ owner, resource string }
-	checked := make(map[pair]bool)
-	for _, claim := range result.Claims {
+	seen := make(map[pair]bool, len(claims))
+	distinct := make([]ownerClaim, 0, len(claims))
+	for _, claim := range claims {
 		if claim.OwnerID == "" {
-			return failOutcome(cfg, failAlwaysClosed, "resolved claim without a data owner", key, nil)
+			return nil, errors.New("resolved claim without a data owner")
 		}
 		p := pair{owner: claim.OwnerID, resource: claim.DataResource}
-		if checked[p] {
+		if seen[p] {
 			continue
 		}
-		checked[p] = true
+		seen[p] = true
+		distinct = append(distinct, ownerClaim{owner: claim.OwnerID, dataResource: claim.DataResource, purpose: claim.Purpose})
+	}
+	return distinct, nil
+}
 
-		req := consent.ConsentRequest{
-			Subject:      claim.OwnerID,
-			Resource:     reqCtx.Path,
-			Method:       reqCtx.Method,
-			DataResource: claim.DataResource,
-			Consumer:     consumerSD,
-			Purpose:      claim.Purpose,
-		}
-		resp, err := consentClient.CheckConsent(context.Background(), req)
-		if err != nil {
-			log.Printf("[consent-filter] ResponseFilter: consent check error for request %s: %v", key, err)
-			return failOutcome(cfg, failModeForError(err), "consent check error: "+err.Error(), key, &req)
-		}
-		if resp.Decision != consent.DecisionAllow {
-			return responseOutcome{
-				decision:  decisionDeny,
-				reason:    resp.Reason,
-				requestID: key,
-				subject:   claim.OwnerID,
-				resource:  resourceOrPath(claim.DataResource, reqCtx.Path),
-				method:    reqCtx.Method,
+// maxConcurrentConsentChecks bounds how many per-owner checks are in flight at
+// once. Serial checks made the response latency the sum of every owner's; an
+// unbounded fan-out would instead make one response a burst against the
+// consent-manager. A small fixed width keeps both bounded.
+const maxConcurrentConsentChecks = 8
+
+// checkOwners enforces deny_all across the resolved claims: every one must have
+// a granted consent for this consumer, or the whole response is denied.
+//
+// Checks run concurrently up to maxConcurrentConsentChecks and short-circuit on
+// the first problem — the remaining calls are cancelled, since nothing they
+// could return would change the answer. The reported outcome is always the
+// lowest-indexed problem, so the decision (and the audit record) does not depend
+// on which goroutine happened to finish first.
+func checkOwners(ctx context.Context, cfg *Config, key string, reqCtx *RequestContext, client *consent.Client, claims []ownerClaim, consumerSD string) responseOutcome {
+	type checkResult struct {
+		outcome   responseOutcome
+		err       error
+		request   consent.ConsentRequest
+		problem   bool
+		attempted bool
+	}
+
+	results := make([]checkResult, len(claims))
+	checksCtx, cancelChecks := context.WithCancel(ctx)
+	defer cancelChecks()
+
+	slots := make(chan struct{}, maxConcurrentConsentChecks)
+	var wg sync.WaitGroup
+
+	for i, claim := range claims {
+		wg.Add(1)
+		go func(i int, claim ownerClaim) {
+			defer wg.Done()
+			select {
+			case slots <- struct{}{}:
+				defer func() { <-slots }()
+			case <-checksCtx.Done():
+				return
 			}
+
+			req := consent.ConsentRequest{
+				Subject:      claim.owner,
+				Resource:     reqCtx.Path,
+				Method:       reqCtx.Method,
+				DataResource: claim.dataResource,
+				Consumer:     consumerSD,
+				Purpose:      claim.purpose,
+			}
+			results[i].attempted = true
+			results[i].request = req
+
+			resp, err := client.CheckConsent(checksCtx, req)
+			switch {
+			case err != nil:
+				results[i].err = err
+				results[i].problem = true
+			case resp.Decision != consent.DecisionAllow:
+				results[i].outcome = responseOutcome{
+					decision:  decisionDeny,
+					reason:    resp.Reason,
+					requestID: key,
+					subject:   claim.owner,
+					resource:  resourceOrPath(claim.dataResource, reqCtx.Path),
+					method:    reqCtx.Method,
+				}
+				results[i].problem = true
+			}
+			if results[i].problem {
+				// Nothing the other owners could say would change a deny_all
+				// verdict, so stop paying for their calls.
+				cancelChecks()
+			}
+		}(i, claim)
+	}
+	wg.Wait()
+
+	for _, result := range results {
+		if !result.attempted || !result.problem {
+			continue
 		}
+		if result.err != nil {
+			// A call cancelled because a *different* owner already denied is not
+			// itself a failure; the deny it lost the race to is reported instead.
+			if errors.Is(result.err, context.Canceled) && ctx.Err() == nil {
+				continue
+			}
+			log.Printf("[consent-filter] ResponseFilter: consent check error for request %s: %v", key, result.err)
+			req := result.request
+			return failOutcome(cfg, failModeForError(result.err), "consent check error: "+result.err.Error(), key, &req)
+		}
+		return result.outcome
 	}
 	return responseOutcome{decision: decisionAllow, requestID: key, resource: reqCtx.Path, method: reqCtx.Method}
 }

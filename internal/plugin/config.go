@@ -37,6 +37,28 @@ const (
 	// OwnerResolver calls.
 	DefaultOwnerResolverTimeout = 2000
 
+	// DefaultResponsePhaseTimeout is the default budget in milliseconds for the
+	// ENTIRE response phase - the party lookups, the resolve call and every
+	// per-owner consent check together. APISIX holds the buffered response for
+	// this whole time, so it must be bounded independently of the per-call
+	// timeouts, which multiply by the number of owners.
+	DefaultResponsePhaseTimeout = 10000
+
+	// DefaultMaxOwnersPerResponse is the default cap on how many distinct data
+	// owners are checked for one response. A collection endpoint returning
+	// hundreds of entities would otherwise issue hundreds of consent checks
+	// before answering.
+	DefaultMaxOwnersPerResponse = 50
+
+	// MinMaxOwnersPerResponse and MaxMaxOwnersPerResponse bound the cap itself.
+	MinMaxOwnersPerResponse = 1
+	MaxMaxOwnersPerResponse = 1000
+
+	// MinResponsePhaseTimeout and MaxResponsePhaseTimeout bound the response-phase
+	// budget in milliseconds (120s is already far beyond any sane gateway timeout).
+	MinResponsePhaseTimeout = 1
+	MaxResponsePhaseTimeout = 120000
+
 	// DefaultConsumerClaim is the dotted claim path holding the consuming
 	// participant's identity. The provider's verifier embeds the presented
 	// credential in the access token (jwtInclusion.fullInclusion), so the
@@ -151,6 +173,19 @@ type Config struct {
 	// OwnerResolver (defaults to DefaultOwnerResolverTimeout).
 	OwnerResolverTimeout int `json:"owner_resolver_timeout,omitempty"`
 
+	// ResponsePhaseTimeout bounds, in milliseconds, the whole response phase:
+	// the party lookups, the resolve call and every per-owner consent check
+	// together. Without it the worst case is the per-call timeout multiplied by
+	// the number of owners, all while APISIX holds the buffered response.
+	// Defaults to DefaultResponsePhaseTimeout.
+	ResponsePhaseTimeout int `json:"response_phase_timeout,omitempty"`
+
+	// MaxOwnersPerResponse caps how many distinct data owners are checked for a
+	// single response. A response resolving to more owners than this is denied
+	// rather than answered after an unbounded number of consent calls.
+	// Defaults to DefaultMaxOwnersPerResponse.
+	MaxOwnersPerResponse int `json:"max_owners_per_response,omitempty"`
+
 	// Service is the logical dataset id sent to the OwnerResolver as
 	// resource.service, so it can select the right rule for this route.
 	Service string `json:"service,omitempty"`
@@ -255,6 +290,12 @@ func (c *Config) applyDefaults() {
 	if c.OwnerResolverTimeout == 0 {
 		c.OwnerResolverTimeout = DefaultOwnerResolverTimeout
 	}
+	if c.ResponsePhaseTimeout == 0 {
+		c.ResponsePhaseTimeout = DefaultResponsePhaseTimeout
+	}
+	if c.MaxOwnersPerResponse == 0 {
+		c.MaxOwnersPerResponse = DefaultMaxOwnersPerResponse
+	}
 	if c.ConsumerClaim == "" {
 		c.ConsumerClaim = DefaultConsumerClaim
 	}
@@ -312,6 +353,16 @@ func (c *Config) Validate() error {
 	if c.DenyStatusCode < MinHTTPStatusCode || c.DenyStatusCode > MaxHTTPStatusCode {
 		return fmt.Errorf("config validation: deny_status_code must be between %d and %d, got %d",
 			MinHTTPStatusCode, MaxHTTPStatusCode, c.DenyStatusCode)
+	}
+
+	if c.ResponsePhaseTimeout < MinResponsePhaseTimeout || c.ResponsePhaseTimeout > MaxResponsePhaseTimeout {
+		return fmt.Errorf("config validation: response_phase_timeout must be between %d and %d, got %d",
+			MinResponsePhaseTimeout, MaxResponsePhaseTimeout, c.ResponsePhaseTimeout)
+	}
+
+	if c.MaxOwnersPerResponse < MinMaxOwnersPerResponse || c.MaxOwnersPerResponse > MaxMaxOwnersPerResponse {
+		return fmt.Errorf("config validation: max_owners_per_response must be between %d and %d, got %d",
+			MinMaxOwnersPerResponse, MaxMaxOwnersPerResponse, c.MaxOwnersPerResponse)
 	}
 
 	if c.AuditEnabled && c.AuditOTLPEndpoint == "" {

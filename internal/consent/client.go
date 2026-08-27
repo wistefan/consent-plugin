@@ -378,6 +378,33 @@ func (c *Client) credentials(ctx context.Context, forceFetch bool) (token, provi
 	return token, providerSD, nil
 }
 
+// identifierCacheTTL bounds how long a (provider, subject) -> userIdentifier
+// mapping is reused. The mapping is stable for the life of the registration, so
+// a short TTL is enough to collapse the repeated searches a single multi-owner
+// response would otherwise make, without holding a stale identifier.
+//
+// Only POSITIVE results are cached. "Unknown subject" must be re-asked every
+// time: a data subject can register at any moment, and remembering that they
+// were unknown would keep denying them after they had consented.
+const identifierCacheTTL = 60 * time.Second
+
+type identifierEntry struct {
+	userIdentifier string
+	expiry         time.Time
+}
+
+var (
+	identifierMu    sync.Mutex
+	identifierCache = map[string]identifierEntry{}
+)
+
+// identifierCacheKey scopes a cached identifier to the credential identity and
+// the provider it was resolved for - the identifier is provider-scoped, so it
+// must never be reused across providers.
+func (c *Client) identifierCacheKey(providerSD, subject string) string {
+	return strings.Join([]string{c.cacheKey(), providerSD, subject}, credentialKeySeparator)
+}
+
 // participantSDCacheTTL bounds how long a DID -> self-description mapping is
 // reused. Participants change rarely, so a generous TTL keeps the registry call
 // off the request path.
@@ -650,11 +677,23 @@ type identifierSearchResponse struct {
 // user "email") to the provider-scoped user identifier. A 404 or empty identifier
 // means the subject is unknown (found == false).
 //
+// A positive result is cached for identifierCacheTTL, so a response resolving to
+// the same owner under several data resources searches once instead of once per
+// resource.
+//
 // It carries both the shared consent key (which the consent-manager's
 // consentKeyCheck validates) and the participant token as a Bearer credential,
 // so an authenticating facade in front of the consent-manager can validate the
 // participant JWT on this call too (the consent-manager ignores the Bearer here).
 func (c *Client) resolveUserIdentifier(ctx context.Context, subject, providerSD, token string) (identifier string, found bool, err error) {
+	cacheKey := c.identifierCacheKey(providerSD, subject)
+	identifierMu.Lock()
+	entry, hit := identifierCache[cacheKey]
+	identifierMu.Unlock()
+	if hit && time.Now().Before(entry.expiry) {
+		return entry.userIdentifier, true, nil
+	}
+
 	payload, err := json.Marshal(map[string]string{"selfDescription": providerSD, "email": subject})
 	if err != nil {
 		return "", false, fmt.Errorf("consent client: failed to marshal identifier search: %w", err)
@@ -694,7 +733,13 @@ func (c *Client) resolveUserIdentifier(ctx context.Context, subject, providerSD,
 	if err := json.Unmarshal(body, &out); err != nil {
 		return "", false, fmt.Errorf("consent client: failed to unmarshal identifier search response: %w", err)
 	}
-	return out.UserIdentifier, out.UserIdentifier != "", nil
+	if out.UserIdentifier == "" {
+		return "", false, nil
+	}
+	identifierMu.Lock()
+	identifierCache[cacheKey] = identifierEntry{userIdentifier: out.UserIdentifier, expiry: time.Now().Add(identifierCacheTTL)}
+	identifierMu.Unlock()
+	return out.UserIdentifier, true, nil
 }
 
 // participantConsentsResponse is the consent-manager response to call 2. The
