@@ -134,7 +134,7 @@ func (c *Client) Resolve(ctx context.Context, res Resource, p Parties, payload [
 		reqBody = &bodyDescriptor{Encoding: encodingJSON, Content: json.RawMessage(payload)}
 	}
 	req := resolveRequest{
-		Resource: resourceDescriptor{Service: res.Service, Method: res.Method, Path: res.Path, ContentType: res.ContentType},
+		Resource: resourceDescriptor(res),
 		Body:     reqBody,
 	}
 	if !p.IsZero() {
@@ -173,9 +173,9 @@ func (c *Client) Resolve(ctx context.Context, res Resource, p Parties, payload [
 }
 
 func truncate(b []byte) string {
-	const max = 256
-	if len(b) <= max {
+	const limit = 256
+	if len(b) <= limit {
 		return string(b)
 	}
-	return string(b[:max]) + "...(truncated)"
+	return string(b[:limit]) + "...(truncated)"
 }

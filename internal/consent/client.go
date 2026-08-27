@@ -432,9 +432,9 @@ type tokenRequest struct {
 // lifetime the token service reported and the configured cap, less a small skew
 // so a token is never presented in the last moments of its life. A service that
 // reports no usable lifetime falls back to the cap.
-func cacheFor(lifetime, cap time.Duration) time.Duration {
-	ttl := cap
-	if lifetime > 0 && lifetime < cap {
+func cacheFor(lifetime, maxLifetime time.Duration) time.Duration {
+	ttl := maxLifetime
+	if lifetime > 0 && lifetime < maxLifetime {
 		ttl = lifetime
 	}
 	if ttl > tokenRefreshSkew {
@@ -467,7 +467,7 @@ func (c *Client) fetchToken(ctx context.Context) (string, time.Duration, error) 
 	if err != nil {
 		return "", 0, fmt.Errorf("consent client: token service request failed: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return "", 0, fmt.Errorf("consent client: failed to read token response: %w", err)

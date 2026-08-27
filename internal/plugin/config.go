@@ -94,6 +94,15 @@ const (
 	EnvAuditOTLPEndpoint = "CONSENT_AUDIT_OTLP_ENDPOINT"
 )
 
+// Accepted URL schemes for the configured endpoints.
+const (
+	// schemeHTTP is the plain-HTTP URL scheme.
+	schemeHTTP = "http"
+
+	// schemeHTTPS is the TLS-protected URL scheme.
+	schemeHTTPS = "https"
+)
+
 // Config holds the plugin configuration that APISIX passes as JSON.
 // It defines how the consent-filter plugin connects to the external consent API
 // and how it handles denial responses.
@@ -283,7 +292,7 @@ func (c *Config) Validate() error {
 	if err != nil {
 		return fmt.Errorf("config validation: consent_api_url is not a valid URL: %w", err)
 	}
-	if parsedURL.Scheme != "http" && parsedURL.Scheme != "https" {
+	if parsedURL.Scheme != schemeHTTP && parsedURL.Scheme != schemeHTTPS {
 		return fmt.Errorf("config validation: consent_api_url must use http or https scheme, got %q", parsedURL.Scheme)
 	}
 
@@ -306,7 +315,7 @@ func (c *Config) Validate() error {
 		if err != nil {
 			return fmt.Errorf("config validation: owner_resolver_url is not a valid URL: %w", err)
 		}
-		if resolverURL.Scheme != "http" && resolverURL.Scheme != "https" {
+		if resolverURL.Scheme != schemeHTTP && resolverURL.Scheme != schemeHTTPS {
 			return fmt.Errorf("config validation: owner_resolver_url must use http or https scheme, got %q", resolverURL.Scheme)
 		}
 	}
@@ -316,7 +325,7 @@ func (c *Config) Validate() error {
 		if err != nil {
 			return fmt.Errorf("config validation: token_service_url is not a valid URL: %w", err)
 		}
-		if tokenServiceURL.Scheme != "http" && tokenServiceURL.Scheme != "https" {
+		if tokenServiceURL.Scheme != schemeHTTP && tokenServiceURL.Scheme != schemeHTTPS {
 			return fmt.Errorf("config validation: token_service_url must use http or https scheme, got %q", tokenServiceURL.Scheme)
 		}
 	}
