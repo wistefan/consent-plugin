@@ -5,6 +5,30 @@
 Do not open a public issue. See [SECURITY.md](SECURITY.md) — this plugin decides
 whether personal data is released, so a defect in it is handled privately first.
 
+## Local toolchain
+
+`go.mod` requires **Go 1.26**. If your system Go is older, the build tries to
+fetch the toolchain automatically — and in an environment where `GOTOOLCHAIN`
+cannot download (an air-gapped machine, a restricted proxy) it fails with
+`toolchain not available`, which reads like "Go 1.26 does not exist" rather than
+"the download was blocked".
+
+Either install Go 1.26+ directly, or point at a full patch version already in the
+module cache and disable switching:
+
+```bash
+ls -d "$(go env GOMODCACHE)"/golang.org/toolchain@*/   # what is cached
+export PATH="$(go env GOMODCACHE)/golang.org/toolchain@v0.0.1-go1.26.7.linux-amd64/bin:$PATH"
+export GOTOOLCHAIN=local
+```
+
+Note the bare major version (`go1.26`) is what fails; the full patch version
+(`go1.26.7`) is what the cache holds.
+
+`golangci-lint` must match the version CI pins — see
+`.github/workflows/style-guide.yml` and `.gitea/workflows/ci.yaml`, which are
+kept in step with each other.
+
 ## Pull requests
 
 - Target the `main` branch.
