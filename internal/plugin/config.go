@@ -140,6 +140,11 @@ const (
 
 	// EnvTokenServiceURL supplies TokenServiceURL (the participant-local OID4VP
 	// token service).
+	//
+	// #nosec G101 -- this is the NAME of an environment variable, not a
+	// credential; it trips the hardcoded-credentials heuristic only because it
+	// contains "TOKEN". The value it names is read from the environment at
+	// ParseConfig time (see applyEnv) and never appears in the source.
 	EnvTokenServiceURL = "CONSENT_TOKEN_SERVICE_URL"
 
 	// EnvAuditOTLPEndpoint supplies AuditOTLPEndpoint (the OTLP/HTTP Collector

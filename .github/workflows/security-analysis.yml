@@ -12,11 +12,25 @@ name: Security Analysis
 # boundary. Keep GOSEC_VERSION and the golangci-lint version in .gitea/workflows/
 # and .github/workflows/style-guide.yml in step, so the two pipelines cannot
 # disagree about whether the code passes.
+#
+# A pin still has to be able to BUILD. gosec is installed from source with the
+# toolchain from go.mod, so its own dependency tree must compile under that Go
+# version: gosec v2.21.4 pinned golang.org/x/tools v0.25.0, which reaches into
+# the internal layout of go/token via unsafe and guards it with a deliberate
+# compile-time tripwire ("if the size of token.FileSet changes, this will fail to
+# compile"). Go 1.26 changed that layout, so the guard fired and the step could
+# never build:
+#
+#   x/tools@v0.25.0/internal/tokeninternal/tokeninternal.go:64:9:
+#   invalid array length -delta * delta (constant -256 of type int64)
+#
+# Any pre-Go-1.26 x/tools is affected, so a scanner pin must be advanced together
+# with the toolchain in go.mod. v2.29.0 builds on golang.org/x/tools v0.49.0.
 on:
   workflow_call:
 
 env:
-  GOSEC_VERSION: v2.21.4
+  GOSEC_VERSION: v2.29.0
 
 jobs:
   govulncheck:
