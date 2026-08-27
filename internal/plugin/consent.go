@@ -37,9 +37,6 @@ import (
 // pluginName is the registered name for this plugin in APISIX configuration.
 const pluginName = "consent-filter"
 
-// jwtSubjectClaim is the JWT claim key used to extract the subject identity.
-const jwtSubjectClaim = "sub"
-
 // nginxRequestIDVar is the Nginx variable ($request_id) holding a unique id
 // per HTTP request. Unlike the runner's per-RPC ID(), it is identical in the
 // RequestFilter (ext-plugin-pre-req) and ResponseFilter (ext-plugin-post-resp)
@@ -95,6 +92,10 @@ func (c *ConsentFilter) ParseConf(in []byte) (interface{}, error) {
 // It extracts the JWT from the configured header, decodes the requested claims,
 // captures all request headers, and stores the context keyed by request ID
 // for later retrieval in ResponseFilter.
+//
+// The JWT is decoded, NOT verified (see internal/jwt): the claims are used only
+// to name the consuming participant for the contract lookup, and the route MUST
+// have an authentication plugin in front of this one that validates the token.
 func (c *ConsentFilter) RequestFilter(conf interface{}, w http.ResponseWriter, r pkgHTTP.Request) {
 	cfg, ok := conf.(*Config)
 	if !ok {
@@ -162,21 +163,27 @@ type responseOutcome struct {
 	method    string
 }
 
-// ResponseFilter gates the upstream response on the data subject's consent.
+// ResponseFilter gates the upstream response on the data owner's consent.
 //
 // The flow is:
 //  1. Correlate with the request phase and load (and delete) the stored context.
-//  2. Build a ConsentRequest (the subject comes from the JWT "sub" claim).
-//  3. Run the two-call consent check against the consent-manager.
+//  2. Ask the OwnerResolver, from the RESPONSE DATA, whether consent is required
+//     and who the data owner(s) are.
+//  3. Run the two-call consent check per resolved owner (deny_all: every owner
+//     must have a granted consent).
 //  4. Allow → pass the response through unchanged; deny → replace it with the
 //     configured denial response.
-//  5. On unresolved context or a consent-manager error, apply the fail policy
-//     (deny unless explicitly fail-open).
+//  5. On unresolved context, a resolver error, or a consent-manager error, apply
+//     the fail policy (deny unless explicitly fail-open).
+//
+// The requestor's identity is NEVER used to determine ownership: the token's
+// "sub" says who is asking, not whose data is being returned, so a check against
+// it would let any subject holding one granted consent read everyone's data.
 //
 // Every decision is recorded to the audit sink (when enabled) before it is
-// enforced. The check is a coarse allow/deny on the subject's consent and is
-// independent of the response body, so — unlike a field-level filter — an empty
-// or non-JSON personal-data response is still gated rather than passed through.
+// enforced. The check is a coarse allow/deny and is independent of the response
+// body's shape, so — unlike a field-level filter — an empty or non-JSON
+// personal-data response is still gated rather than passed through.
 func (c *ConsentFilter) ResponseFilter(conf interface{}, w pkgHTTP.Response) {
 	cfg, ok := conf.(*Config)
 	if !ok {
@@ -213,23 +220,16 @@ func (c *ConsentFilter) evaluate(cfg *Config, w pkgHTTP.Response) responseOutcom
 		return failOutcome(cfg, "no request context", key, nil)
 	}
 
+	// Resolve the data owner(s) from the response DATA and check consent per
+	// owner. ParseConfig guarantees a resolver is configured.
 	consentClient := consent.NewClient(clientConfigFromCfg(cfg))
-
-	// Owner-resolver mode: resolve the data owner(s) from the response DATA and
-	// check consent per owner (never the requestor). Falls back to the legacy
-	// JWT-subject mode when no resolver is configured.
-	if cfg.OwnerResolverURL != "" {
-		return c.evaluateWithResolver(cfg, w, key, reqCtx, consentClient)
-	}
-
-	consentReq := buildConsentRequest(reqCtx)
-	return checkConsent(cfg, key, consentClient, consentReq)
+	return c.evaluateWithResolver(cfg, w, key, reqCtx, consentClient)
 }
 
 // evaluateWithResolver reads the upstream body, asks the OwnerResolver who owns
 // the data (and whether consent is required), and enforces deny_all: every
 // distinct (owner, dataResource) claim must have a granted consent, or the whole
-// response is denied. The requestor identity is never consulted.
+// response is denied. The requestor identity is never consulted for ownership.
 func (c *ConsentFilter) evaluateWithResolver(cfg *Config, w pkgHTTP.Response, key string, reqCtx *RequestContext, consentClient *consent.Client) responseOutcome {
 	body, err := w.ReadBody()
 	if err != nil {
@@ -316,27 +316,6 @@ func (c *ConsentFilter) evaluateWithResolver(cfg *Config, w pkgHTTP.Response, ke
 	return responseOutcome{decision: decisionAllow, requestID: key, resource: reqCtx.Path, method: reqCtx.Method}
 }
 
-// checkConsent runs a single consent check and maps it to an outcome (legacy
-// JWT-subject mode).
-func checkConsent(cfg *Config, key string, client *consent.Client, req consent.ConsentRequest) responseOutcome {
-	resp, err := client.CheckConsent(context.Background(), req)
-	if err != nil {
-		return failOutcome(cfg, "consent check error: "+err.Error(), key, &req)
-	}
-	decision := decisionDeny
-	if resp.Decision == consent.DecisionAllow {
-		decision = decisionAllow
-	}
-	return responseOutcome{
-		decision:  decision,
-		reason:    resp.Reason,
-		requestID: key,
-		subject:   req.Subject,
-		resource:  req.Resource,
-		method:    req.Method,
-	}
-}
-
 // clientConfigFromCfg builds the consent-manager client config from the plugin config.
 func clientConfigFromCfg(cfg *Config) consent.ClientConfig {
 	return consent.ClientConfig{
@@ -397,27 +376,6 @@ func recordAudit(cfg *Config, outcome responseOutcome) {
 		Decision:  outcome.decision,
 		Reason:    outcome.reason,
 	})
-}
-
-// buildConsentRequest creates a ConsentRequest from the stored request context.
-// The subject (used to look up consent) is taken from the JWT "sub" claim.
-func buildConsentRequest(reqCtx *RequestContext) consent.ConsentRequest {
-	consentReq := consent.ConsentRequest{
-		Resource: reqCtx.Path,
-		Method:   reqCtx.Method,
-		Claims:   reqCtx.JWTClaims,
-	}
-
-	// Extract subject from JWT claims if available.
-	if reqCtx.JWTClaims != nil {
-		if sub, ok := reqCtx.JWTClaims[jwtSubjectClaim]; ok {
-			if subStr, ok := sub.(string); ok {
-				consentReq.Subject = subStr
-			}
-		}
-	}
-
-	return consentReq
 }
 
 // denyResponse writes a denial response to the client using the configured

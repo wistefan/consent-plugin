@@ -118,21 +118,26 @@ type Config struct {
 	// Defaults to DefaultJWTHeaderName ("Authorization").
 	JWTHeaderName string `json:"jwt_header_name,omitempty"`
 
-	// JWTClaimsToForward specifies which JWT claims to send to the consent API.
-	// For example: ["sub", "scope"]. Must include "sub" — the consent check
-	// resolves the data subject from the "sub" claim.
+	// JWTClaimsToForward lists the JWT claims the request phase decodes and keeps.
+	// An empty list decodes every claim. The claims identify the CONSUMER (see
+	// ConsumerClaim) for the contract lookup; they never identify the data owner.
 	JWTClaimsToForward []string `json:"jwt_claims_to_forward,omitempty"`
 
 	// ConsentAPIPrefix is the consent-manager API prefix prepended to endpoint
 	// paths. Defaults to DefaultConsentAPIPrefix ("/v1").
 	ConsentAPIPrefix string `json:"consent_api_prefix,omitempty"`
 
-	// OwnerResolverURL is the external OwnerResolver /resolve endpoint. When set,
-	// the data owner is resolved from the RESPONSE DATA (never the requestor):
+	// OwnerResolverURL is the external OwnerResolver /resolve endpoint (required).
+	// The data owner is resolved from the RESPONSE DATA, never from the requestor:
 	// the plugin posts the payload, gets back (owner[, dataResource]) claims, and
-	// checks consent per owner. When empty, the plugin falls back to the legacy
-	// behaviour of taking the subject from the JWT.
-	OwnerResolverURL string `json:"owner_resolver_url,omitempty"`
+	// checks consent per owner.
+	//
+	// It is required because the only alternative — treating the access token's
+	// "sub" as the data subject — asks whether the CALLER has consented, which
+	// establishes no link between the caller and the data being returned and so
+	// gates nothing (any subject with one granted consent becomes a universal
+	// reader).
+	OwnerResolverURL string `json:"owner_resolver_url"`
 
 	// ConsentAPIHost overrides the HTTP Host header sent on consent-manager
 	// calls. Needed when ConsentAPIURL points at an in-cluster gateway service
@@ -244,10 +249,10 @@ func (c *Config) applyDefaults() {
 	if c.ConsentAPIPrefix == "" {
 		c.ConsentAPIPrefix = DefaultConsentAPIPrefix
 	}
-	if c.OwnerResolverURL != "" && c.OwnerResolverTimeout == 0 {
+	if c.OwnerResolverTimeout == 0 {
 		c.OwnerResolverTimeout = DefaultOwnerResolverTimeout
 	}
-	if c.OwnerResolverURL != "" && c.ConsumerClaim == "" {
+	if c.ConsumerClaim == "" {
 		c.ConsumerClaim = DefaultConsumerClaim
 	}
 	if c.TokenAudience == "" {
@@ -310,14 +315,18 @@ func (c *Config) Validate() error {
 		return errors.New("config validation: audit_otlp_endpoint is required when audit_enabled is true")
 	}
 
-	if c.OwnerResolverURL != "" {
-		resolverURL, err := url.ParseRequestURI(c.OwnerResolverURL)
-		if err != nil {
-			return fmt.Errorf("config validation: owner_resolver_url is not a valid URL: %w", err)
-		}
-		if resolverURL.Scheme != schemeHTTP && resolverURL.Scheme != schemeHTTPS {
-			return fmt.Errorf("config validation: owner_resolver_url must use http or https scheme, got %q", resolverURL.Scheme)
-		}
+	// The resolver is the only source of data ownership, so a route without one
+	// cannot gate anything and must not load.
+	if c.OwnerResolverURL == "" {
+		return errors.New("config validation: owner_resolver_url is required — " +
+			"the data owner is resolved from the response data, and without a resolver the plugin cannot determine whose consent to check")
+	}
+	resolverURL, err := url.ParseRequestURI(c.OwnerResolverURL)
+	if err != nil {
+		return fmt.Errorf("config validation: owner_resolver_url is not a valid URL: %w", err)
+	}
+	if resolverURL.Scheme != schemeHTTP && resolverURL.Scheme != schemeHTTPS {
+		return fmt.Errorf("config validation: owner_resolver_url must use http or https scheme, got %q", resolverURL.Scheme)
 	}
 
 	if c.TokenServiceURL != "" {

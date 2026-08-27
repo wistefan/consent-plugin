@@ -28,7 +28,8 @@ import (
 // validConfigJSON returns a minimal valid configuration JSON for testing.
 func validConfigJSON() map[string]interface{} {
 	return map[string]interface{}{
-		"consent_api_url": "https://consent.example.com/api",
+		"consent_api_url":    "https://consent.example.com/api",
+		"owner_resolver_url": "https://owner-resolver.example.com/resolve",
 	}
 }
 
@@ -50,7 +51,7 @@ func TestParseConfig(t *testing.T) {
 	}{
 		{
 			name:  "valid config with only required field applies defaults",
-			input: []byte(`{"consent_api_url": "https://consent.example.com/api"}`),
+			input: []byte(`{"consent_api_url": "https://consent.example.com/api", "owner_resolver_url": "https://owner-resolver.example.com/resolve"}`),
 			check: func(t *testing.T, cfg *Config) {
 				assert.Equal(t, "https://consent.example.com/api", cfg.ConsentAPIURL)
 				assert.Equal(t, DefaultConsentAPITimeout, cfg.ConsentAPITimeout)
@@ -66,6 +67,7 @@ func TestParseConfig(t *testing.T) {
 			input: func() []byte {
 				m := map[string]interface{}{
 					"consent_api_url":            "http://localhost:8080/consent",
+					"owner_resolver_url":         "http://localhost:9090/resolve",
 					"consent_api_timeout":        10000,
 					"jwt_header_name":            "X-Auth-Token",
 					"jwt_claims_to_forward":      []string{"sub", "scope", "aud"},
@@ -78,6 +80,7 @@ func TestParseConfig(t *testing.T) {
 			}(),
 			check: func(t *testing.T, cfg *Config) {
 				assert.Equal(t, "http://localhost:8080/consent", cfg.ConsentAPIURL)
+				assert.Equal(t, "http://localhost:9090/resolve", cfg.OwnerResolverURL)
 				assert.Equal(t, 10000, cfg.ConsentAPITimeout)
 				assert.Equal(t, "X-Auth-Token", cfg.JWTHeaderName)
 				assert.Equal(t, []string{"sub", "scope", "aud"}, cfg.JWTClaimsToForward)
@@ -351,6 +354,7 @@ func TestConfig_Validate(t *testing.T) {
 			config: Config{
 				ConsentAPIURL:           "https://consent.example.com",
 				ConsentAPITimeout:       DefaultConsentAPITimeout,
+				OwnerResolverURL:        "https://owner-resolver.example.com/resolve",
 				JWTHeaderName:           DefaultJWTHeaderName,
 				DenyStatusCode:          DefaultDenyStatusCode,
 				DenyResponseBody:        DefaultDenyResponseBody,
@@ -367,10 +371,21 @@ func TestConfig_Validate(t *testing.T) {
 			errSubstr: "consent_api_url is required",
 		},
 		{
+			name: "missing owner_resolver_url fails",
+			config: Config{
+				ConsentAPIURL:     "https://consent.example.com",
+				ConsentAPITimeout: DefaultConsentAPITimeout,
+				DenyStatusCode:    DefaultDenyStatusCode,
+			},
+			wantErr:   true,
+			errSubstr: "owner_resolver_url is required",
+		},
+		{
 			name: "negative timeout fails",
 			config: Config{
 				ConsentAPIURL:     "https://consent.example.com",
 				ConsentAPITimeout: -1,
+				OwnerResolverURL:  "https://owner-resolver.example.com/resolve",
 				DenyStatusCode:    DefaultDenyStatusCode,
 			},
 			wantErr:   true,
@@ -398,7 +413,7 @@ func TestConsentFilter_ParseConf_Integration(t *testing.T) {
 	p := &ConsentFilter{}
 
 	t.Run("valid config returns *Config", func(t *testing.T) {
-		input := []byte(`{"consent_api_url": "https://consent.example.com/api"}`)
+		input := []byte(`{"consent_api_url": "https://consent.example.com/api", "owner_resolver_url": "https://owner-resolver.example.com/resolve"}`)
 		conf, err := p.ParseConf(input)
 		require.NoError(t, err)
 
