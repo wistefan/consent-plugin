@@ -109,7 +109,7 @@ Configured via the APISIX route plugin JSON (identically on both `ext-plugin-pre
 | `response_phase_timeout` | `int` | No | `10000` | Budget in ms for the **entire** response phase — party lookups, `/resolve`, and every per-owner consent check together. APISIX holds the buffered response for this whole time, so it is bounded independently of the per-call timeouts. Range 1–120000. |
 | `max_owners_per_response` | `int` | No | `50` | Maximum distinct data owners checked for one response. A response resolving to more is denied rather than answered after an unbounded number of consent calls. Range 1–1000. |
 | `consumer_claim` | `string` | No | `verifiableCredential.issuer` | Dotted claim path naming the **consuming participant**. Used for the contract lookup and to scope the consent match — never for ownership. |
-| `consent_api_prefix` | `string` | No | `/v1` | API prefix prepended to endpoint paths (the consent-manager's `API_PREFIX`). Must start with `/`. |
+| `consent_api_prefix` | `string` | No | `/v1` | API prefix prepended to endpoint paths (the consent-manager's `API_PREFIX`). Must start with `/`; a trailing `/` is trimmed. |
 | `consent_api_host` | `string` | No | — | Overrides the HTTP `Host` header on consent-manager calls. Needed when `consent_api_url` points at an in-cluster service whose gateway route is host-scoped to the public ingress name. |
 | `consent_api_timeout` | `int` | No | `5000` | Per-call timeout in ms. Range 1–60000. |
 | `consent_key` | `string` | No | — | Shared secret sent as `x-visionstrust-consent-key` on call 1. **Optional**: behind the authority's facade the key is injected server-side (and overrides anything sent here). Falls back to `CONSENT_KEY`. |
@@ -130,8 +130,8 @@ Configured via the APISIX route plugin JSON (identically on both `ext-plugin-pre
 
 \* Provide **either** `token_service_url` (recommended) **or** a static
 `participant_token`. This is enforced at parse time: a route with neither cannot
-authenticate as the participant and so cannot gate anything, and is rejected
-rather than loaded.
+authenticate as the participant and so cannot complete a single consent check,
+and is rejected rather than loaded.
 
 † Required only when `audit_enabled` is `true`.
 

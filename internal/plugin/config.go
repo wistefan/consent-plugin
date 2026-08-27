@@ -26,6 +26,7 @@ import (
 	"log"
 	"net/url"
 	"os"
+	"strings"
 )
 
 // Default values for optional configuration fields.
@@ -58,6 +59,15 @@ const (
 	// budget in milliseconds (120s is already far beyond any sane gateway timeout).
 	MinResponsePhaseTimeout = 1
 	MaxResponsePhaseTimeout = 120000
+
+	// MinOwnerResolverTimeout and MaxOwnerResolverTimeout bound the per-call
+	// OwnerResolver timeout in milliseconds.
+	MinOwnerResolverTimeout = 1
+	MaxOwnerResolverTimeout = 60000
+
+	// apiPrefixSeparator is the path separator an API prefix must start with. A
+	// prefix without it is silently concatenated into a malformed URL.
+	apiPrefixSeparator = "/"
 
 	// DefaultConsumerClaim is the dotted claim path holding the consuming
 	// participant's identity. The provider's verifier embeds the presented
@@ -287,6 +297,11 @@ func (c *Config) applyDefaults() {
 	if c.ConsentAPIPrefix == "" {
 		c.ConsentAPIPrefix = DefaultConsentAPIPrefix
 	}
+	// The prefix is concatenated directly with the endpoint path, so a trailing
+	// separator would produce a double slash in every URL.
+	if c.ConsentAPIPrefix != apiPrefixSeparator {
+		c.ConsentAPIPrefix = strings.TrimRight(c.ConsentAPIPrefix, apiPrefixSeparator)
+	}
 	if c.OwnerResolverTimeout == 0 {
 		c.OwnerResolverTimeout = DefaultOwnerResolverTimeout
 	}
@@ -345,6 +360,28 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("config validation: consent_api_url must use http or https scheme, got %q", parsedURL.Scheme)
 	}
 
+	// The resolver is the only source of data ownership, so a route without one
+	// cannot gate anything and must not load.
+	if c.OwnerResolverURL == "" {
+		return errors.New("config validation: owner_resolver_url is required — " +
+			"the data owner is resolved from the response data, and without a resolver the plugin cannot determine whose consent to check")
+	}
+	resolverURL, err := url.ParseRequestURI(c.OwnerResolverURL)
+	if err != nil {
+		return fmt.Errorf("config validation: owner_resolver_url is not a valid URL: %w", err)
+	}
+	if resolverURL.Scheme != schemeHTTP && resolverURL.Scheme != schemeHTTPS {
+		return fmt.Errorf("config validation: owner_resolver_url must use http or https scheme, got %q", resolverURL.Scheme)
+	}
+
+	// The prefix is concatenated with the endpoint path rather than joined, so a
+	// missing leading separator silently yields a malformed URL and every call
+	// fails with a confusing 404.
+	if !strings.HasPrefix(c.ConsentAPIPrefix, apiPrefixSeparator) {
+		return fmt.Errorf("config validation: consent_api_prefix must start with %q, got %q",
+			apiPrefixSeparator, c.ConsentAPIPrefix)
+	}
+
 	if c.ConsentAPITimeout < MinConsentAPITimeout || c.ConsentAPITimeout > MaxConsentAPITimeout {
 		return fmt.Errorf("config validation: consent_api_timeout must be between %d and %d, got %d",
 			MinConsentAPITimeout, MaxConsentAPITimeout, c.ConsentAPITimeout)
@@ -353,6 +390,11 @@ func (c *Config) Validate() error {
 	if c.DenyStatusCode < MinHTTPStatusCode || c.DenyStatusCode > MaxHTTPStatusCode {
 		return fmt.Errorf("config validation: deny_status_code must be between %d and %d, got %d",
 			MinHTTPStatusCode, MaxHTTPStatusCode, c.DenyStatusCode)
+	}
+
+	if c.OwnerResolverTimeout < MinOwnerResolverTimeout || c.OwnerResolverTimeout > MaxOwnerResolverTimeout {
+		return fmt.Errorf("config validation: owner_resolver_timeout must be between %d and %d, got %d",
+			MinOwnerResolverTimeout, MaxOwnerResolverTimeout, c.OwnerResolverTimeout)
 	}
 
 	if c.ResponsePhaseTimeout < MinResponsePhaseTimeout || c.ResponsePhaseTimeout > MaxResponsePhaseTimeout {
@@ -369,20 +411,6 @@ func (c *Config) Validate() error {
 		return errors.New("config validation: audit_otlp_endpoint is required when audit_enabled is true")
 	}
 
-	// The resolver is the only source of data ownership, so a route without one
-	// cannot gate anything and must not load.
-	if c.OwnerResolverURL == "" {
-		return errors.New("config validation: owner_resolver_url is required — " +
-			"the data owner is resolved from the response data, and without a resolver the plugin cannot determine whose consent to check")
-	}
-	resolverURL, err := url.ParseRequestURI(c.OwnerResolverURL)
-	if err != nil {
-		return fmt.Errorf("config validation: owner_resolver_url is not a valid URL: %w", err)
-	}
-	if resolverURL.Scheme != schemeHTTP && resolverURL.Scheme != schemeHTTPS {
-		return fmt.Errorf("config validation: owner_resolver_url must use http or https scheme, got %q", resolverURL.Scheme)
-	}
-
 	if c.TokenServiceURL != "" {
 		tokenServiceURL, err := url.ParseRequestURI(c.TokenServiceURL)
 		if err != nil {
@@ -391,6 +419,15 @@ func (c *Config) Validate() error {
 		if tokenServiceURL.Scheme != schemeHTTP && tokenServiceURL.Scheme != schemeHTTPS {
 			return fmt.Errorf("config validation: token_service_url must use http or https scheme, got %q", tokenServiceURL.Scheme)
 		}
+	}
+
+	// Call 2 is authenticated as the participant, so a route with neither a token
+	// service nor a static token cannot complete a single check. Loading it
+	// cleanly and discovering that per request — as one log line, on the data
+	// path — is how a typo becomes an outage or, with fail_open, a silent bypass.
+	if c.TokenServiceURL == "" && c.ParticipantToken == "" {
+		return errors.New("config validation: one of token_service_url or participant_token is required — " +
+			"without a way to authenticate as the participant no consent check can succeed")
 	}
 
 	return nil

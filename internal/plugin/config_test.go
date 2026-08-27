@@ -30,6 +30,7 @@ func validConfigJSON() map[string]interface{} {
 	return map[string]interface{}{
 		"consent_api_url":    "https://consent.example.com/api",
 		"owner_resolver_url": "https://owner-resolver.example.com/resolve",
+		"token_service_url":  "https://consent-facade.example.com/internal/tokens",
 	}
 }
 
@@ -51,7 +52,7 @@ func TestParseConfig(t *testing.T) {
 	}{
 		{
 			name:  "valid config with only required field applies defaults",
-			input: []byte(`{"consent_api_url": "https://consent.example.com/api", "owner_resolver_url": "https://owner-resolver.example.com/resolve"}`),
+			input: []byte(`{"consent_api_url": "https://consent.example.com/api", "owner_resolver_url": "https://owner-resolver.example.com/resolve", "token_service_url": "https://facade.example.com/internal/tokens"}`),
 			check: func(t *testing.T, cfg *Config) {
 				assert.Equal(t, "https://consent.example.com/api", cfg.ConsentAPIURL)
 				assert.Equal(t, DefaultConsentAPITimeout, cfg.ConsentAPITimeout)
@@ -68,6 +69,7 @@ func TestParseConfig(t *testing.T) {
 				m := map[string]interface{}{
 					"consent_api_url":            "http://localhost:8080/consent",
 					"owner_resolver_url":         "http://localhost:9090/resolve",
+					"participant_token":          "static-token",
 					"consent_api_timeout":        10000,
 					"jwt_header_name":            "X-Auth-Token",
 					"jwt_claims_to_forward":      []string{"sub", "scope", "aud"},
@@ -245,7 +247,9 @@ func TestParseConfig_EnvFallback(t *testing.T) {
 		t.Setenv(EnvConsentKey, "ck-from-env")
 		t.Setenv(EnvTokenServiceURL, "http://facade-from-env:8080/internal/tokens")
 
-		cfg, err := ParseConfig(toJSON(t, validConfigJSON()))
+		in := validConfigJSON()
+		delete(in, "token_service_url") // so the env var is the only source
+		cfg, err := ParseConfig(toJSON(t, in))
 		require.NoError(t, err)
 		assert.Equal(t, "ck-from-env", cfg.ConsentKey)
 		assert.Equal(t, "http://facade-from-env:8080/internal/tokens", cfg.TokenServiceURL)
@@ -355,6 +359,9 @@ func TestConfig_Validate(t *testing.T) {
 				ConsentAPIURL:           "https://consent.example.com",
 				ConsentAPITimeout:       DefaultConsentAPITimeout,
 				OwnerResolverURL:        "https://owner-resolver.example.com/resolve",
+				OwnerResolverTimeout:    DefaultOwnerResolverTimeout,
+				ConsentAPIPrefix:        DefaultConsentAPIPrefix,
+				ParticipantToken:        "static-token",
 				ResponsePhaseTimeout:    DefaultResponsePhaseTimeout,
 				MaxOwnersPerResponse:    DefaultMaxOwnersPerResponse,
 				JWTHeaderName:           DefaultJWTHeaderName,
@@ -377,6 +384,8 @@ func TestConfig_Validate(t *testing.T) {
 			config: Config{
 				ConsentAPIURL:        "https://consent.example.com",
 				ConsentAPITimeout:    DefaultConsentAPITimeout,
+				ConsentAPIPrefix:     DefaultConsentAPIPrefix,
+				OwnerResolverTimeout: DefaultOwnerResolverTimeout,
 				ResponsePhaseTimeout: DefaultResponsePhaseTimeout,
 				MaxOwnersPerResponse: DefaultMaxOwnersPerResponse,
 				DenyStatusCode:       DefaultDenyStatusCode,
@@ -385,10 +394,58 @@ func TestConfig_Validate(t *testing.T) {
 			errSubstr: "owner_resolver_url is required",
 		},
 		{
+			name: "no credential source fails",
+			config: Config{
+				ConsentAPIURL:        "https://consent.example.com",
+				ConsentAPITimeout:    DefaultConsentAPITimeout,
+				ConsentAPIPrefix:     DefaultConsentAPIPrefix,
+				OwnerResolverURL:     "https://owner-resolver.example.com/resolve",
+				OwnerResolverTimeout: DefaultOwnerResolverTimeout,
+				ResponsePhaseTimeout: DefaultResponsePhaseTimeout,
+				MaxOwnersPerResponse: DefaultMaxOwnersPerResponse,
+				DenyStatusCode:       DefaultDenyStatusCode,
+			},
+			wantErr:   true,
+			errSubstr: "one of token_service_url or participant_token is required",
+		},
+		{
+			name: "a consent_api_prefix without a leading slash fails",
+			config: Config{
+				ConsentAPIURL:        "https://consent.example.com",
+				ConsentAPITimeout:    DefaultConsentAPITimeout,
+				ConsentAPIPrefix:     "v1",
+				OwnerResolverURL:     "https://owner-resolver.example.com/resolve",
+				OwnerResolverTimeout: DefaultOwnerResolverTimeout,
+				ParticipantToken:     "static-token",
+				ResponsePhaseTimeout: DefaultResponsePhaseTimeout,
+				MaxOwnersPerResponse: DefaultMaxOwnersPerResponse,
+				DenyStatusCode:       DefaultDenyStatusCode,
+			},
+			wantErr:   true,
+			errSubstr: "consent_api_prefix must start with",
+		},
+		{
+			name: "an out-of-range owner_resolver_timeout fails",
+			config: Config{
+				ConsentAPIURL:        "https://consent.example.com",
+				ConsentAPITimeout:    DefaultConsentAPITimeout,
+				ConsentAPIPrefix:     DefaultConsentAPIPrefix,
+				OwnerResolverURL:     "https://owner-resolver.example.com/resolve",
+				OwnerResolverTimeout: MaxOwnerResolverTimeout + 1,
+				ParticipantToken:     "static-token",
+				ResponsePhaseTimeout: DefaultResponsePhaseTimeout,
+				MaxOwnersPerResponse: DefaultMaxOwnersPerResponse,
+				DenyStatusCode:       DefaultDenyStatusCode,
+			},
+			wantErr:   true,
+			errSubstr: "owner_resolver_timeout must be between",
+		},
+		{
 			name: "negative timeout fails",
 			config: Config{
 				ConsentAPIURL:     "https://consent.example.com",
 				ConsentAPITimeout: -1,
+				ConsentAPIPrefix:  DefaultConsentAPIPrefix,
 				OwnerResolverURL:  "https://owner-resolver.example.com/resolve",
 				DenyStatusCode:    DefaultDenyStatusCode,
 			},
@@ -417,7 +474,7 @@ func TestConsentFilter_ParseConf_Integration(t *testing.T) {
 	p := &ConsentFilter{}
 
 	t.Run("valid config returns *Config", func(t *testing.T) {
-		input := []byte(`{"consent_api_url": "https://consent.example.com/api", "owner_resolver_url": "https://owner-resolver.example.com/resolve"}`)
+		input := []byte(`{"consent_api_url": "https://consent.example.com/api", "owner_resolver_url": "https://owner-resolver.example.com/resolve", "token_service_url": "https://facade.example.com/internal/tokens"}`)
 		conf, err := p.ParseConf(input)
 		require.NoError(t, err)
 
@@ -503,6 +560,32 @@ func TestClaimKeysToDecode(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			got := claimKeysToDecode(&Config{JWTClaimsToForward: tt.forward, ConsumerClaim: tt.consumer})
 			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+// TestParseConfig_PrefixNormalisation verifies a trailing separator is trimmed
+// rather than concatenated into a double slash in every endpoint URL.
+func TestParseConfig_PrefixNormalisation(t *testing.T) {
+	cases := []struct {
+		name       string
+		configured string
+		want       string
+	}{
+		{name: "defaults when omitted", configured: "", want: DefaultConsentAPIPrefix},
+		{name: "keeps a well-formed prefix", configured: "/v2", want: "/v2"},
+		{name: "trims a trailing separator", configured: "/v2/", want: "/v2"},
+		{name: "a bare separator is left alone", configured: "/", want: "/"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			in := validConfigJSON()
+			if tc.configured != "" {
+				in["consent_api_prefix"] = tc.configured
+			}
+			cfg, err := ParseConfig(toJSON(t, in))
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, cfg.ConsentAPIPrefix)
 		})
 	}
 }

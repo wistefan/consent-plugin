@@ -45,7 +45,7 @@ func TestConsentFilter_ParseConf(t *testing.T) {
 	}{
 		{
 			name:    "valid config returns parsed Config",
-			input:   []byte(`{"consent_api_url": "https://consent.example.com", "owner_resolver_url": "https://resolver.example.com/resolve"}`),
+			input:   []byte(`{"consent_api_url": "https://consent.example.com", "owner_resolver_url": "https://resolver.example.com/resolve", "participant_token": "t"}`),
 			wantErr: false,
 		},
 		{
