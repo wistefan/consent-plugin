@@ -115,8 +115,12 @@ var (
 func init() {
 	// Publish the store's size and eviction count so a leak is observable rather
 	// than only inferable from memory growth.
-	metrics.RegisterGauge(metrics.ContextStoreSizeGauge, func() float64 { return float64(RequestContextStoreSize()) })
-	metrics.RegisterGauge(metrics.ContextEvictedGauge, func() float64 { return float64(RequestContextsEvicted()) })
+	metrics.RegisterGauge(metrics.ContextStoreSizeGauge,
+		"Request contexts currently held, i.e. gated requests in flight.",
+		func() float64 { return float64(RequestContextStoreSize()) })
+	metrics.RegisterCounter(metrics.ContextEvictedCounter,
+		"Request contexts evicted because they expired or the store was full.",
+		func() float64 { return float64(RequestContextsEvicted()) })
 }
 
 // startContextJanitor launches the background sweep exactly once. It is started

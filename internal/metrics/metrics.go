@@ -88,11 +88,24 @@ var (
 	// scoping was not actually applied.
 	purposeUnconstrained uint64
 
-	// gauges are read at scrape time from whoever owns the number, so this
+	// callbacks are read at scrape time from whoever owns the number, so this
 	// package never has to be told when a store's size changes.
-	gaugeMu sync.Mutex
-	gauges  = map[string]func() float64{}
+	callbackMu sync.Mutex
+	callbacks  = map[string]callbackMetric{}
 )
+
+// Prometheus metric types used in the exposition.
+const (
+	metricTypeCounter = "counter"
+	metricTypeGauge   = "gauge"
+)
+
+// callbackMetric is a value this package does not own, read at scrape time.
+type callbackMetric struct {
+	help string
+	kind string
+	read func() float64
+}
 
 // labelPair is a two-label metric key.
 type labelPair struct{ first, second string }
@@ -155,12 +168,28 @@ func RecordPurposeUnconstrained() {
 	purposeUnconstrained++
 }
 
-// RegisterGauge publishes a value read at scrape time. The owner of the number
-// keeps owning it; this package only asks for it.
-func RegisterGauge(name string, read func() float64) {
-	gaugeMu.Lock()
-	defer gaugeMu.Unlock()
-	gauges[name] = read
+// RegisterGauge publishes a value that can go up and down, read at scrape time.
+// The owner of the number keeps owning it; this package only asks for it.
+func RegisterGauge(name, help string, read func() float64) {
+	registerCallback(name, help, metricTypeGauge, read)
+}
+
+// RegisterCounter publishes a monotonically increasing value, read at scrape
+// time.
+//
+// The distinction from RegisterGauge is not cosmetic: a `_total` series declared
+// as a gauge makes `promtool check metrics` complain, and anyone reaching for
+// `rate(..._total[5m])` over it is relying on an accident rather than on a
+// stated contract.
+func RegisterCounter(name, help string, read func() float64) {
+	registerCallback(name, help, metricTypeCounter, read)
+}
+
+// registerCallback records a scrape-time value of the given Prometheus type.
+func registerCallback(name, help, kind string, read func() float64) {
+	callbackMu.Lock()
+	defer callbackMu.Unlock()
+	callbacks[name] = callbackMetric{help: help, kind: kind, read: read}
 }
 
 // Handler serves the metrics in the Prometheus text exposition format.
@@ -192,11 +221,11 @@ func render() string {
 	fmt.Fprintf(&out, "# TYPE %s histogram\n", dependencyLatency)
 	for _, dependency := range sortedMapKeys(latency) {
 		h := latency[dependency]
-		cumulative := uint64(0)
 		for i, bound := range latencyBuckets {
-			cumulative = h.counts[i]
+			// counts is already cumulative: observe increments every bucket whose
+			// bound is at or above the value.
 			fmt.Fprintf(&out, "%s_bucket{dependency=%q,le=%q} %d\n",
-				dependencyLatency, dependency, strconv.FormatFloat(bound, 'g', -1, 64), cumulative)
+				dependencyLatency, dependency, strconv.FormatFloat(bound, 'g', -1, 64), h.counts[i])
 		}
 		fmt.Fprintf(&out, "%s_bucket{dependency=%q,le=\"+Inf\"} %d\n", dependencyLatency, dependency, h.total)
 		fmt.Fprintf(&out, "%s_sum{dependency=%q} %s\n", dependencyLatency, dependency, strconv.FormatFloat(h.sum, 'g', -1, 64))
@@ -204,17 +233,19 @@ func render() string {
 	}
 	mu.Unlock()
 
-	gaugeMu.Lock()
-	names := make([]string, 0, len(gauges))
-	for name := range gauges {
+	callbackMu.Lock()
+	names := make([]string, 0, len(callbacks))
+	for name := range callbacks {
 		names = append(names, name)
 	}
 	sort.Strings(names)
 	for _, name := range names {
-		fmt.Fprintf(&out, "# TYPE %s gauge\n%s %s\n", name, name,
-			strconv.FormatFloat(gauges[name](), 'g', -1, 64))
+		metric := callbacks[name]
+		fmt.Fprintf(&out, "# HELP %s %s\n", name, metric.help)
+		fmt.Fprintf(&out, "# TYPE %s %s\n", name, metric.kind)
+		fmt.Fprintf(&out, "%s %s\n", name, strconv.FormatFloat(metric.read(), 'g', -1, 64))
 	}
-	gaugeMu.Unlock()
+	callbackMu.Unlock()
 
 	return out.String()
 }
@@ -248,20 +279,23 @@ func sortedMapKeys(m map[string]*histogram) []string {
 	return keys
 }
 
-// Gauge names published by the rest of the plugin.
+// Metric names published by the rest of the plugin through RegisterGauge and
+// RegisterCounter.
 const (
-	// ContextStoreSizeGauge tracks in-flight gated requests. In a healthy runner
-	// it returns to zero when idle; a floor that keeps rising is the leak.
+	// ContextStoreSizeGauge tracks in-flight gated requests. It goes up and down,
+	// so it is a gauge: in a healthy runner it returns to zero when idle, and a
+	// floor that keeps rising is the leak.
 	ContextStoreSizeGauge = contextStoreSizeMetric
 
-	// ContextEvictedGauge counts contexts dropped because they expired or the
-	// store was full — requests that never reached their response phase.
-	ContextEvictedGauge = contextEvictedMetric
+	// ContextEvictedCounter counts contexts dropped because they expired or the
+	// store was full — requests that never reached their response phase. It only
+	// increases, so it is a counter.
+	ContextEvictedCounter = contextEvictedMetric
 
-	// AuditDroppedGauge counts audit records lost to a full queue. An attacker
+	// AuditDroppedCounter counts audit records lost to a full queue. An attacker
 	// who can generate load can suppress the record of their own access, so this
-	// must be alertable.
-	AuditDroppedGauge = auditDroppedMetric
+	// must be alertable. It only increases, so it is a counter.
+	AuditDroppedCounter = auditDroppedMetric
 )
 
 // Reset clears every metric. For tests.
@@ -273,7 +307,7 @@ func Reset() {
 	purposeUnconstrained = 0
 	mu.Unlock()
 
-	gaugeMu.Lock()
-	gauges = map[string]func() float64{}
-	gaugeMu.Unlock()
+	callbackMu.Lock()
+	callbacks = map[string]callbackMetric{}
+	callbackMu.Unlock()
 }

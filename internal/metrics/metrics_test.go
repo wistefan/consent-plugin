@@ -43,7 +43,8 @@ func TestRenderExposition(t *testing.T) {
 	RecordDependencyCall(DependencyConsentManager, OutcomeSuccess, 20*time.Millisecond)
 	RecordDependencyCall(DependencyConsentManager, OutcomeError, 3*time.Second)
 
-	RegisterGauge(ContextStoreSizeGauge, func() float64 { return 7 })
+	RegisterGauge(ContextStoreSizeGauge, "Request contexts currently held.", func() float64 { return 7 })
+	RegisterCounter(ContextEvictedCounter, "Request contexts evicted.", func() float64 { return 3 })
 
 	out := render()
 
@@ -63,6 +64,13 @@ func TestRenderExposition(t *testing.T) {
 	assert.Contains(t, out, "consent_request_context_store_size 7")
 	assert.Contains(t, out, "# TYPE consent_decisions_total counter")
 	assert.Contains(t, out, "# TYPE consent_dependency_duration_seconds histogram")
+
+	// A `_total` series must be declared a counter, or `rate()` over it is an
+	// accident rather than a contract; and every family needs a HELP line.
+	assert.Contains(t, out, "# TYPE consent_request_context_store_size gauge")
+	assert.Contains(t, out, "# TYPE consent_request_contexts_evicted_total counter")
+	assert.Contains(t, out, "# HELP consent_request_context_store_size Request contexts currently held.")
+	assert.Contains(t, out, "# HELP consent_request_contexts_evicted_total Request contexts evicted.")
 }
 
 // TestGaugesAreReadAtScrapeTime verifies a gauge reflects the current value
@@ -72,7 +80,7 @@ func TestGaugesAreReadAtScrapeTime(t *testing.T) {
 	t.Cleanup(Reset)
 
 	size := 0
-	RegisterGauge(ContextStoreSizeGauge, func() float64 { return float64(size) })
+	RegisterGauge(ContextStoreSizeGauge, "Request contexts currently held.", func() float64 { return float64(size) })
 
 	assert.Contains(t, render(), "consent_request_context_store_size 0")
 	size = 42
@@ -104,8 +112,8 @@ func TestRenderIsStable(t *testing.T) {
 	}
 	RecordDependencyCall(DependencyOwnerResolver, OutcomeSuccess, time.Millisecond)
 	RecordDependencyCall(DependencyConsentManager, OutcomeSuccess, time.Millisecond)
-	RegisterGauge(AuditDroppedGauge, func() float64 { return 1 })
-	RegisterGauge(ContextStoreSizeGauge, func() float64 { return 2 })
+	RegisterCounter(AuditDroppedCounter, "Audit events dropped.", func() float64 { return 1 })
+	RegisterGauge(ContextStoreSizeGauge, "Request contexts currently held.", func() float64 { return 2 })
 
 	first := render()
 	for i := 0; i < 20; i++ {

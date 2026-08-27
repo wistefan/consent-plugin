@@ -158,7 +158,9 @@ func init() {
 	// An attacker who can generate load can suppress the record of their own
 	// access by filling the queue, so the loss must be alertable, not merely
 	// logged every hundredth event.
-	metrics.RegisterGauge(metrics.AuditDroppedGauge, func() float64 { return float64(Dropped()) })
+	metrics.RegisterCounter(metrics.AuditDroppedCounter,
+		"Audit events discarded because the export queue was full.",
+		func() float64 { return float64(Dropped()) })
 }
 
 // Get returns a shared Emitter for cfg, creating (and starting) one on first use.
