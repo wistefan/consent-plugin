@@ -190,4 +190,6 @@ Releasing requires the `QUAY_USERNAME` / `QUAY_PASSWORD` repository secrets.
 
 ## License
 
-See [LICENSE](LICENSE) for details.
+Apache-2.0 - see [LICENSE](LICENSE). Every Go source file carries the copyright header from
+[`hack/license-header.txt`](hack/license-header.txt); `make license-check` verifies it and CI enforces
+it on pull requests, on `main`, and as a gate on the pre-release and release.

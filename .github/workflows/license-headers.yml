@@ -1,0 +1,16 @@
+name: License Headers
+
+# Reusable check: every Go source file must carry the Apache-2.0 copyright
+# header. The header text and the check live in hack/, so this workflow, the
+# `make license-check` target and a local run share one source of truth.
+on:
+  workflow_call:
+
+jobs:
+  license-headers:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify copyright headers
+        run: ./hack/license-header.sh check

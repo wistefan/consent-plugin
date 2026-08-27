@@ -24,7 +24,13 @@ env:
   IMAGE_NAME: consent-plugin
 
 jobs:
+  # The copyright headers gate the pre-release too, so an unheadered file cannot
+  # be published even as a PRE image.
+  license-headers:
+    uses: ./.github/workflows/license-headers.yml
+
   generate-version:
+    needs: license-headers
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.out.outputs.version }}
