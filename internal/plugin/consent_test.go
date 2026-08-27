@@ -27,6 +27,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -1546,4 +1547,64 @@ func metricsExposition() string {
 	recorder := httptest.NewRecorder()
 	metrics.Handler().ServeHTTP(recorder, httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/metrics", nil))
 	return recorder.Body.String()
+}
+
+// TestAuditReasonCarriesNoDependencyBody verifies a dependency's response body
+// cannot reach the audit sink through the decision reason.
+//
+// Errors from the consent client become the reason, and the reason is exported.
+// A consent-manager 500 that echoes the user's identifier in its body would
+// therefore land in the audit record and on stdout — and truncating it, as an
+// earlier version did, is not redaction: the surviving prefix of a JSON error
+// body is usually exactly the part with the identifiers in it. The reason must
+// be a stable classification instead.
+func TestAuditReasonCarriesNoDependencyBody(t *testing.T) {
+	clearContextStore()
+	consent.ResetCaches()
+
+	const leakedIdentifier = "alice@example.org"
+
+	var mu sync.Mutex
+	var reasons []string
+	collector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		reasons = append(reasons, string(body))
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer collector.Close()
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/participants", participantRegistryHandler)
+	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		// A dependency echoing personal data in its error page.
+		_, _ = w.Write([]byte(`{"error":"lookup failed for ` + leakedIdentifier + `","trace":"..."}`))
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	resolver := newOwnerResolver(t, ownedBy(testOwnerDID))
+	defer resolver.Close()
+
+	cfg := newTestConfig(server.URL, resolver.URL+"/resolve")
+	cfg.AuditEnabled = true
+	cfg.AuditOTLPEndpoint = collector.URL
+	cfg.AuditServiceName = "consent-access-audit-leak-test"
+
+	const id = uint32(290)
+	storeRequest(id)
+	(&ConsentFilter{}).ResponseFilter(cfg, newMockResponse(id, []byte(`{"id":"x"}`)))
+	audit.ShutdownAll()
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.NotEmpty(t, reasons, "the decision should have been audited")
+	for _, payload := range reasons {
+		assert.NotContains(t, payload, leakedIdentifier,
+			"a dependency response body must not reach the audit sink through the reason")
+	}
+	assert.Contains(t, strings.Join(reasons, ""), "identifier search returned status 500",
+		"the reason should classify the failure instead")
 }

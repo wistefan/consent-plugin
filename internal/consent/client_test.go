@@ -499,16 +499,6 @@ func TestCheckConsentContextCancellation(t *testing.T) {
 	assert.Contains(t, err.Error(), "HTTP request failed")
 }
 
-func TestTruncateBody(t *testing.T) {
-	assert.Equal(t, "short", truncateBody([]byte("short")))
-	assert.Equal(t, "", truncateBody([]byte{}))
-	assert.NotContains(t, truncateBody(make([]byte, maxBodyLogLength)), "...(truncated)")
-
-	long := truncateBody(make([]byte, maxBodyLogLength+100))
-	assert.Contains(t, long, "...(truncated)")
-	assert.Equal(t, maxBodyLogLength+len("...(truncated)"), len(long))
-}
-
 // TestCacheKeyDistinguishesCredentialIdentities verifies that two clients that
 // differ in any input feeding the cached token or provider self-description get
 // distinct cache keys. Sharing an entry across credential identities would make

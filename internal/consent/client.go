@@ -524,7 +524,7 @@ func (c *Client) lookupParticipantSD(ctx context.Context, did string, forceLogin
 		return "", errParticipantUnauthorized
 	}
 	if status != http.StatusOK {
-		return "", fmt.Errorf("consent client: participants lookup returned status %d, body: %s", status, truncateBody(body))
+		return "", unexpectedStatus("participants lookup", status, body)
 	}
 
 	participants, err := decodeParticipants(body)
@@ -626,8 +626,7 @@ func (c *Client) fetchToken(ctx context.Context) (string, time.Duration, error) 
 		return "", 0, fmt.Errorf("consent client: failed to read token response: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return "", 0, fmt.Errorf("consent client: token service returned status %d, body: %s",
-			resp.StatusCode, truncateBody(body))
+		return "", 0, unexpectedStatus("token service", resp.StatusCode, body)
 	}
 	var out tokenResponse
 	if err := json.Unmarshal(body, &out); err != nil {
@@ -660,8 +659,7 @@ func (c *Client) fetchProviderSD(ctx context.Context, token string) (string, err
 		return "", errParticipantUnauthorized
 	}
 	if status != http.StatusOK {
-		return "", fmt.Errorf("consent client: participant lookup (/me) returned status %d, body: %s",
-			status, truncateBody(body))
+		return "", unexpectedStatus("participant lookup (/me)", status, body)
 	}
 	var out meResponse
 	if err := json.Unmarshal(body, &out); err != nil {
@@ -731,8 +729,7 @@ func (c *Client) resolveUserIdentifier(ctx context.Context, subject, providerSD,
 		return "", false, errParticipantUnauthorized
 	}
 	if status != http.StatusOK {
-		return "", false, fmt.Errorf("consent client: identifier search returned status %d, body: %s",
-			status, truncateBody(body))
+		return "", false, unexpectedStatus("identifier search", status, body)
 	}
 	var out identifierSearchResponse
 	if err := json.Unmarshal(body, &out); err != nil {
@@ -880,8 +877,7 @@ func (c *Client) hasGrantedConsent(ctx context.Context, token, userIdentifier st
 		return false, errParticipantUnauthorized
 	}
 	if status != http.StatusOK {
-		return false, fmt.Errorf("consent client: consents lookup returned status %d, body: %s",
-			status, truncateBody(body))
+		return false, unexpectedStatus("consents lookup", status, body)
 	}
 	var out participantConsentsResponse
 	if err := json.Unmarshal(body, &out); err != nil {
@@ -924,13 +920,23 @@ func (c *Client) do(httpReq *http.Request) (statusCode int, body []byte, err err
 	return resp.StatusCode, body, nil
 }
 
-// maxBodyLogLength bounds error-body length in messages.
-const maxBodyLogLength = 256
-
-// truncateBody returns the response body as a string, truncated to maxBodyLogLength.
-func truncateBody(body []byte) string {
-	if len(body) <= maxBodyLogLength {
-		return string(body)
-	}
-	return string(body[:maxBodyLogLength]) + "...(truncated)"
+// unexpectedStatus builds the error for an unexpected response status from a
+// dependency, and sends the response BODY to a debug log rather than into the
+// error.
+//
+// These errors do not stay in the process: the plugin wraps them into the
+// decision reason, which is exported to the audit sink and written to stdout. A
+// consent-manager 500 that echoes the user identifier in its body would
+// therefore land in both — and truncating it, as an earlier version did, is not
+// redaction: the first surviving characters of a JSON error body are usually
+// exactly the part with the identifiers in it.
+//
+// The error text is instead a stable, low-cardinality classification, which is
+// what an audit reason wants anyway — it is queried, not read. The body is still
+// available at debug level, rate-limited per operation so a failing dependency
+// cannot flood the log with it.
+func unexpectedStatus(operation string, status int, body []byte) error {
+	logging.DebugfEvery("dependency-body:"+operation,
+		"consent client: %s returned status %d, body: %s", operation, status, logging.Sanitize(string(body)))
+	return fmt.Errorf("consent client: %s returned status %d", operation, status)
 }

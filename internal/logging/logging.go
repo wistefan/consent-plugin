@@ -117,6 +117,17 @@ func allow(key string) (bool, uint64) {
 	return true, suppressed
 }
 
+// DebugfEvery logs at debug level at most once per suppressionInterval for the
+// given key, noting how many occurrences were suppressed in between.
+//
+// This is where a dependency's response body belongs: useful when debugging,
+// off by default, and never on a path that escapes into an audit record.
+func DebugfEvery(key, template string, args ...interface{}) {
+	if ok, suppressed := allow(key); ok {
+		Debugf(template+suppressedSuffix(suppressed), args...)
+	}
+}
+
 // WarnfEvery logs at warn level at most once per suppressionInterval for the
 // given key, noting how many occurrences were suppressed in between.
 func WarnfEvery(key, template string, args ...interface{}) {

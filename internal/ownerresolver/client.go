@@ -24,6 +24,7 @@ package ownerresolver
 
 import (
 	"bytes"
+	"consent-plugin/internal/logging"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -195,7 +196,13 @@ func (c *Client) Resolve(ctx context.Context, res Resource, p Parties, payload [
 		return Result{}, fmt.Errorf("owner-resolver: read response: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return Result{}, fmt.Errorf("owner-resolver: status %d: %s", resp.StatusCode, truncate(body))
+		// The body goes to a debug log, not into the error: this error becomes the
+		// plugin's decision reason, which is exported to the audit sink and
+		// written to stdout, and a resolver error page can echo the payload it was
+		// given — which is the personal data the gate exists to protect.
+		logging.DebugfEvery("resolver-body",
+			"owner-resolver: status %d, body: %s", resp.StatusCode, logging.Sanitize(string(body)))
+		return Result{}, fmt.Errorf("owner-resolver: status %d", resp.StatusCode)
 	}
 
 	var out Result
@@ -215,12 +222,4 @@ func describeBody(payload []byte, contentType string) *bodyDescriptor {
 	default:
 		return &bodyDescriptor{Encoding: encodingOpaque, ContentType: contentType, Size: len(payload)}
 	}
-}
-
-func truncate(b []byte) string {
-	const limit = 256
-	if len(b) <= limit {
-		return string(b)
-	}
-	return string(b[:limit]) + "...(truncated)"
 }
