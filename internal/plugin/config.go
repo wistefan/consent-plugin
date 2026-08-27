@@ -210,6 +210,19 @@ type Config struct {
 	// Defaults to DefaultResponsePhaseTimeout.
 	ResponsePhaseTimeout int `json:"response_phase_timeout,omitempty"`
 
+	// RequirePurpose makes a resolved claim that names no processing purpose a
+	// denial instead of an unscoped check.
+	//
+	// Purpose matching depends on the OwnerResolver populating an optional field,
+	// so a resolver whose rules never set it silently runs with purpose scoping
+	// disabled — a consent granted for one purpose then authorises release for
+	// any other. Defaults to false, because requiring it would break every
+	// deployment whose resolver does not emit it yet; turn it on once yours does,
+	// and the property becomes enforced rather than hoped for. The
+	// consent_purpose_unconstrained_total metric counts the checks this would
+	// have denied.
+	RequirePurpose bool `json:"require_purpose,omitempty"`
+
 	// MaxResolveBodyBytes caps the upstream body forwarded to the OwnerResolver.
 	//
 	// The body is read whole, validated as JSON, and marshalled again into the

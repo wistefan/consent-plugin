@@ -20,6 +20,8 @@ package plugin
 import (
 	"consent-plugin/internal/audit"
 	"consent-plugin/internal/consent"
+	"consent-plugin/internal/logging"
+	"consent-plugin/internal/metrics"
 	"consent-plugin/internal/ownerresolver"
 	"context"
 	"encoding/json"
@@ -1463,4 +1465,85 @@ func TestCheckOwners_ErrorStillAppliesFailPolicy(t *testing.T) {
 			assert.Equal(t, 0, resp.writtenStatus, "a dependency error with fail_open must still pass through")
 		})
 	}
+}
+
+// TestCheckPurposeScoping covers what happens when the resolver names no
+// processing purpose for a claim.
+//
+// Purpose matching depends on a different service populating an optional field,
+// so a resolver whose rules stop emitting it silently disables half of the
+// consumer/purpose scoping — a consent granted for one purpose then authorises
+// release for any other. Without require_purpose that is counted and logged;
+// with it, it denies.
+func TestCheckPurposeScoping(t *testing.T) {
+	tests := []struct {
+		name             string
+		requirePurpose   bool
+		failOpen         bool
+		claims           []ownerClaim
+		wantOK           bool
+		wantUnconstained int
+	}{
+		{
+			name:   "every claim carries a purpose",
+			claims: []ownerClaim{{owner: "a", purpose: "insurance-quote"}, {owner: "b", purpose: "insurance-quote"}},
+			wantOK: true,
+		},
+		{
+			name:             "a missing purpose is counted when not required",
+			claims:           []ownerClaim{{owner: "a"}, {owner: "b", purpose: "research"}},
+			wantOK:           true,
+			wantUnconstained: 1,
+		},
+		{
+			name:             "every unscoped claim is counted",
+			claims:           []ownerClaim{{owner: "a"}, {owner: "b"}},
+			wantOK:           true,
+			wantUnconstained: 2,
+		},
+		{
+			name:           "a missing purpose denies when required",
+			requirePurpose: true,
+			claims:         []ownerClaim{{owner: "a", purpose: "research"}, {owner: "b"}},
+			wantOK:         false,
+		},
+		{
+			// require_purpose is a policy the operator asked for, not an outage,
+			// so fail_open must not lift it.
+			name:           "require_purpose denies even with fail-open",
+			requirePurpose: true,
+			failOpen:       true,
+			claims:         []ownerClaim{{owner: "a"}},
+			wantOK:         false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			metrics.Reset()
+			t.Cleanup(metrics.Reset)
+			logging.ResetSuppression()
+
+			cfg := newTestConfig("http://consent.invalid", "http://resolver.invalid/resolve")
+			cfg.RequirePurpose = tt.requirePurpose
+			cfg.FailOpen = boolPtr(tt.failOpen)
+
+			outcome, ok := checkPurposeScoping(cfg, "req-1", tt.claims)
+
+			assert.Equal(t, tt.wantOK, ok)
+			if !tt.wantOK {
+				assert.Equal(t, decisionDeny, outcome.decision,
+					"require_purpose is a policy, not an outage — fail_open must not lift it")
+				return
+			}
+			assert.Contains(t, metricsExposition(), fmt.Sprintf("consent_purpose_unconstrained_total %d", tt.wantUnconstained))
+		})
+	}
+}
+
+// metricsExposition renders the current metrics for assertion.
+func metricsExposition() string {
+	recorder := httptest.NewRecorder()
+	metrics.Handler().ServeHTTP(recorder, httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/metrics", nil))
+	return recorder.Body.String()
 }

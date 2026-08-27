@@ -72,7 +72,8 @@ Access is **allowed** only if a returned consent satisfies all of:
 - `status == "granted"`;
 - it was granted to the **consuming participant** identified from the token (a
   consent names one consumer; one granted to X is not authority for Y);
-- it covers the **purpose**, when the resolver named one for the claim;
+- it covers the **purpose**, when the resolver named one for the claim (set
+  `require_purpose` to deny rather than proceed unscoped when it does not);
 - it covers the **data resource**, when the resolver scoped the claim to one.
 
 The owner DID is sent as the user `email` (the consent-manager's
@@ -114,6 +115,7 @@ Configured via the APISIX route plugin JSON (identically on both `ext-plugin-pre
 | `owner_resolver_timeout` | `int` | No | `2000` | Per-call timeout in ms for `/resolve`. Range 1–60000. |
 | `service` | `string` | No | — | Logical dataset id sent to the OwnerResolver as `resource.service`, so it can select the rule for this route. |
 | `response_phase_timeout` | `int` | No | `10000` | Budget in ms for the **entire** response phase — party lookups, `/resolve`, and every per-owner consent check together. APISIX holds the buffered response for this whole time, so it is bounded independently of the per-call timeouts. Range 1–120000. |
+| `require_purpose` | `bool` | No | `false` | Deny when a resolved claim names no processing purpose. Purpose matching depends on the OwnerResolver populating an optional field, so a resolver that never sets it runs with purpose scoping silently disabled; turn this on once yours emits one. `consent_purpose_unconstrained_total` counts the checks it would deny. |
 | `max_resolve_body_bytes` | `int` | No | `1048576` | Maximum upstream body forwarded to the OwnerResolver. A larger body is denied rather than copied — the body is held whole, validated and marshalled again, so the peak footprint is ~3× its size per in-flight request on top of APISIX's own buffering. Range 1–104857600. |
 | `max_owners_per_response` | `int` | No | `50` | Maximum distinct data owners checked for one response. A response resolving to more is denied rather than answered after an unbounded number of consent calls. Range 1–1000. |
 | `consumer_claim` | `string` | No | `verifiableCredential.issuer` | Dotted claim path naming the **consuming participant**. Supports array indexing (`verifiableCredential[0].issuer`), and a bare segment landing on an array traverses its first element — a Verifiable Presentation routinely carries `verifiableCredential` as an array. Used for the contract lookup and to scope the consent match — never for ownership. |

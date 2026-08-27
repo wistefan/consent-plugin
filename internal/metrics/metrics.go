@@ -42,12 +42,13 @@ import (
 
 // Metric names. The consent_ prefix keeps them together in a shared registry.
 const (
-	decisionsMetric        = "consent_decisions_total"
-	dependencyCallsMetric  = "consent_dependency_calls_total"
-	dependencyLatency      = "consent_dependency_duration_seconds"
-	contextStoreSizeMetric = "consent_request_context_store_size"
-	contextEvictedMetric   = "consent_request_contexts_evicted_total"
-	auditDroppedMetric     = "consent_audit_events_dropped_total"
+	decisionsMetric            = "consent_decisions_total"
+	dependencyCallsMetric      = "consent_dependency_calls_total"
+	dependencyLatency          = "consent_dependency_duration_seconds"
+	purposeUnconstrainedMetric = "consent_purpose_unconstrained_total"
+	contextStoreSizeMetric     = "consent_request_context_store_size"
+	contextEvictedMetric       = "consent_request_contexts_evicted_total"
+	auditDroppedMetric         = "consent_audit_events_dropped_total"
 )
 
 // Dependency names used as the "dependency" label.
@@ -81,6 +82,11 @@ var (
 
 	// latency holds one histogram per dependency.
 	latency = map[string]*histogram{}
+
+	// purposeUnconstrained counts consent checks run without a processing
+	// purpose to match against, i.e. checks where half of the consumer/purpose
+	// scoping was not actually applied.
+	purposeUnconstrained uint64
 
 	// gauges are read at scrape time from whoever owns the number, so this
 	// package never has to be told when a store's size changes.
@@ -135,6 +141,20 @@ func RecordDependencyCall(dependency, outcome string, duration time.Duration) {
 	h.observe(duration.Seconds())
 }
 
+// RecordPurposeUnconstrained counts one consent check made without a processing
+// purpose to scope it.
+//
+// Purpose matching depends on the OwnerResolver populating an optional field. A
+// resolver whose rules never set it leaves purpose scoping entirely disabled,
+// which is a silent narrowing of a compliance property — a consent granted for
+// one purpose then authorises release for any other. This makes that state
+// visible and alertable instead of merely documented.
+func RecordPurposeUnconstrained() {
+	mu.Lock()
+	defer mu.Unlock()
+	purposeUnconstrained++
+}
+
 // RegisterGauge publishes a value read at scrape time. The owner of the number
 // keeps owning it; this package only asks for it.
 func RegisterGauge(name string, read func() float64) {
@@ -163,6 +183,10 @@ func render() string {
 		"decision", "fail_mode", decisions)
 	writeCounter(&out, dependencyCallsMetric, "Outbound calls to a dependency, by outcome.",
 		"dependency", "outcome", dependencyCalls)
+
+	fmt.Fprintf(&out, "# HELP %s Consent checks run without a processing purpose to scope them.\n", purposeUnconstrainedMetric)
+	fmt.Fprintf(&out, "# TYPE %s counter\n", purposeUnconstrainedMetric)
+	fmt.Fprintf(&out, "%s %d\n", purposeUnconstrainedMetric, purposeUnconstrained)
 
 	fmt.Fprintf(&out, "# HELP %s Duration of outbound dependency calls in seconds.\n", dependencyLatency)
 	fmt.Fprintf(&out, "# TYPE %s histogram\n", dependencyLatency)
@@ -246,6 +270,7 @@ func Reset() {
 	decisions = map[labelPair]uint64{}
 	dependencyCalls = map[labelPair]uint64{}
 	latency = map[string]*histogram{}
+	purposeUnconstrained = 0
 	mu.Unlock()
 
 	gaugeMu.Lock()

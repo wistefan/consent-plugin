@@ -367,6 +367,10 @@ func (c *ConsentFilter) evaluateWithResolver(cfg *Config, w pkgHTTP.Response, ke
 	if err != nil {
 		return failOutcome(cfg, failAlwaysClosed, err.Error(), key, nil)
 	}
+	if outcome, ok := checkPurposeScoping(cfg, key, claims); !ok {
+		return outcome
+	}
+
 	if len(claims) > cfg.MaxOwnersPerResponse {
 		logging.WarnfEvery("owner-cap", "ResponseFilter: %d distinct data owners for request %s exceeds max_owners_per_response=%d; denying",
 			len(claims), key, cfg.MaxOwnersPerResponse)
@@ -376,6 +380,29 @@ func (c *ConsentFilter) evaluateWithResolver(cfg *Config, w pkgHTTP.Response, ke
 	}
 
 	return checkOwners(phaseCtx, cfg, key, reqCtx, consentClient, claims, consumerSD)
+}
+
+// checkPurposeScoping reports whether every resolved claim carries a processing
+// purpose, and what to do when one does not.
+//
+// With require_purpose set, a claim without a purpose denies: it is a policy the
+// operator asked for, not an outage, so the fail policy does not apply to it.
+// Otherwise the check proceeds unscoped by purpose and is counted, so a resolver
+// that has silently stopped emitting purposes is visible in the metrics instead
+// of quietly widening what a consent authorises.
+func checkPurposeScoping(cfg *Config, key string, claims []ownerClaim) (responseOutcome, bool) {
+	for _, claim := range claims {
+		if claim.purpose != "" {
+			continue
+		}
+		if cfg.RequirePurpose {
+			logging.WarnfEvery("purpose-required", "ResponseFilter: resolved claim without a processing purpose for request %s and require_purpose is set; denying", key)
+			return failOutcome(cfg, failAlwaysClosed, "resolved claim without a processing purpose", key, nil), false
+		}
+		metrics.RecordPurposeUnconstrained()
+		logging.WarnfEvery("purpose-unconstrained", "ResponseFilter: the resolver named no processing purpose, so consent is matched on the consumer alone; set require_purpose once the resolver emits one")
+	}
+	return responseOutcome{}, true
 }
 
 // ownerClaim is one distinct (owner, dataResource) pair to check.

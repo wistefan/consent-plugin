@@ -784,3 +784,72 @@ func TestResolveUserIdentifier_UnknownSubjectNotCached(t *testing.T) {
 	defer m.mu.Unlock()
 	assert.Equal(t, 3, m.searchCalls, "an unknown subject must not be cached as unknown")
 }
+
+// TestCheckConsent_PurposeScoped verifies the purpose leg of the consumer /
+// purpose / resource match. It is load-bearing once the resolver names a
+// purpose: a consent granted for "insurance quote" must not authorise a release
+// for research.
+func TestCheckConsent_PurposeScoped(t *testing.T) {
+	const (
+		grantedPurpose = "insurance-quote"
+		otherPurpose   = "research"
+	)
+
+	tests := []struct {
+		name            string
+		consentPurposes []string
+		requestPurpose  string
+		wantDecision    Decision
+	}{
+		{
+			name:            "matching purpose allows",
+			consentPurposes: []string{grantedPurpose},
+			requestPurpose:  grantedPurpose,
+			wantDecision:    DecisionAllow,
+		},
+		{
+			name:            "a different purpose denies",
+			consentPurposes: []string{grantedPurpose},
+			requestPurpose:  otherPurpose,
+			wantDecision:    DecisionDeny,
+		},
+		{
+			name:            "one of several purposes matching allows",
+			consentPurposes: []string{otherPurpose, grantedPurpose},
+			requestPurpose:  grantedPurpose,
+			wantDecision:    DecisionAllow,
+		},
+		{
+			name:            "a consent covering no purpose denies a purpose-scoped check",
+			consentPurposes: nil,
+			requestPurpose:  grantedPurpose,
+			wantDecision:    DecisionDeny,
+		},
+		{
+			// The caller could not determine a purpose, so it is not part of the
+			// match; the consumer match still applies.
+			name:            "no requested purpose leaves the check unscoped",
+			consentPurposes: []string{grantedPurpose},
+			requestPurpose:  "",
+			wantDecision:    DecisionAllow,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resetCredCache()
+			m := &mockCM{userID: "uid-1", statuses: []string{"granted"}, consentPurposes: tt.consentPurposes}
+			srv := newMockCM(t, m)
+			c := NewClient(ClientConfig{BaseURL: srv.URL, ConsentKey: "ck", ParticipantToken: "static", ProviderSD: "sd"})
+
+			resp, err := c.CheckConsent(context.Background(), ConsentRequest{
+				Subject: "did:key:zOwner", Consumer: testConsumerSD, Purpose: tt.requestPurpose,
+			})
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantDecision, resp.Decision)
+			if tt.wantDecision == DecisionDeny {
+				assert.Contains(t, resp.Reason, "no granted consent")
+			}
+		})
+	}
+}
