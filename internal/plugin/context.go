@@ -21,6 +21,7 @@ import (
 	"consent-plugin/internal/logging"
 	"consent-plugin/internal/metrics"
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 )
@@ -63,6 +64,18 @@ const (
 	// backstop against an unauthenticated memory-exhaustion primitive: a client
 	// that opens requests and aborts before the response leaks one entry each.
 	MaxRequestContexts = 100_000
+
+	// contextEvictionBatch is how many entries an overflow evicts at once.
+	//
+	// Freeing a single slot per overflow meant a full store paid a whole-map scan
+	// on EVERY subsequent request, serialised behind the store's mutex — and the
+	// store only reaches the cap under the leak or abort-flood the cap exists to
+	// contain. The O(n) path was therefore guaranteed to engage exactly when load
+	// was already pathological, converting an unbounded memory leak into an
+	// unbounded latency cliff. Evicting a batch amortises the scan over the whole
+	// batch, so the cost is paid once per contextEvictionBatch requests instead
+	// of once per request.
+	contextEvictionBatch = MaxRequestContexts / 100
 )
 
 // storedRequestContext is one entry plus the time it was stored, which is what
@@ -128,8 +141,8 @@ func startContextJanitor() {
 // It overwrites any previously stored context for the same key.
 //
 // The store is bounded: when it is full, expired entries are swept first and,
-// failing that, the oldest entry is evicted so a new request is never refused
-// service by a leak from an older one.
+// failing that, a batch of the oldest entries is evicted, so a new request is
+// never refused service by a leak from an older one.
 func StoreRequestContext(requestKey string, ctx *RequestContext) {
 	startContextJanitor()
 
@@ -145,25 +158,47 @@ func StoreRequestContext(requestKey string, ctx *RequestContext) {
 	requestContextStore[requestKey] = storedRequestContext{ctx: ctx, storedAt: now}
 }
 
-// evictForSpaceLocked makes room in a full store: expired entries first, then —
-// if everything is still live — the single oldest entry. Callers must hold
+// evictForSpaceLocked makes room in a full store: expired entries first and, if
+// everything is still live, a batch of the oldest. Callers must hold
 // requestContextMu.
+//
+// Both paths scan the map, which is why they free many slots rather than one:
+// the next contextEvictionBatch requests then find room without scanning at all.
 func evictForSpaceLocked(now time.Time) {
 	if n := sweepLocked(now); n > 0 {
 		logging.WarnfEvery("context-store-full", "request-context store full (%d), evicted %d expired entr(ies)", MaxRequestContexts, n)
 		return
 	}
-	oldestKey, oldestAt := "", time.Time{}
+	if n := evictOldestLocked(contextEvictionBatch); n > 0 {
+		logging.ErrorfEvery("context-store-overflow",
+			"request-context store full (%d) with no expired entries, evicted the %d oldest", MaxRequestContexts, n)
+	}
+}
+
+// evictOldestLocked removes up to batch of the oldest entries and returns how
+// many it removed. Callers must hold requestContextMu.
+func evictOldestLocked(batch int) int {
+	if batch <= 0 || len(requestContextStore) == 0 {
+		return 0
+	}
+	type aged struct {
+		key      string
+		storedAt time.Time
+	}
+	entries := make([]aged, 0, len(requestContextStore))
 	for key, entry := range requestContextStore {
-		if oldestAt.IsZero() || entry.storedAt.Before(oldestAt) {
-			oldestKey, oldestAt = key, entry.storedAt
-		}
+		entries = append(entries, aged{key: key, storedAt: entry.storedAt})
 	}
-	if oldestKey != "" {
-		delete(requestContextStore, oldestKey)
-		contextsEvicted++
-		logging.ErrorfEvery("context-store-overflow", "request-context store full (%d) with no expired entries, evicted the oldest", MaxRequestContexts)
+	sort.Slice(entries, func(i, j int) bool { return entries[i].storedAt.Before(entries[j].storedAt) })
+
+	if batch > len(entries) {
+		batch = len(entries)
 	}
+	for _, entry := range entries[:batch] {
+		delete(requestContextStore, entry.key)
+	}
+	contextsEvicted += uint64(batch)
+	return batch
 }
 
 // sweepRequestContexts removes every entry stored more than RequestContextTTL

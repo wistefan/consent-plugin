@@ -149,6 +149,11 @@ func TestSweepRequestContexts(t *testing.T) {
 // TestStoreRequestContext_EnforcesCap verifies a full store makes room instead
 // of growing without bound — the backstop against a client that opens requests
 // and aborts before the response phase.
+//
+// It also pins the amortisation: an overflow evicts a BATCH, so the whole-map
+// scan is paid once per contextEvictionBatch requests rather than on every
+// request. Freeing one slot at a time turned the cap from a memory bound into a
+// latency cliff, engaging precisely under the flood the cap exists to contain.
 func TestStoreRequestContext_EnforcesCap(t *testing.T) {
 	clearContextStore()
 	defer clearContextStore()
@@ -166,12 +171,51 @@ func TestStoreRequestContext_EnforcesCap(t *testing.T) {
 
 	StoreRequestContext("newest", &RequestContext{Path: "/new"})
 
-	assert.Equal(t, MaxRequestContexts, RequestContextStoreSize(), "the store must not exceed its cap")
-	assert.Equal(t, uint64(1), RequestContextsEvicted())
+	assert.Equal(t, MaxRequestContexts-contextEvictionBatch+1, RequestContextStoreSize(),
+		"an overflow must evict a batch, not a single entry")
+	assert.Equal(t, uint64(contextEvictionBatch), RequestContextsEvicted())
+
+	// The batch taken is the oldest one.
 	_, ok := LoadAndDeleteRequestContext("live-0")
-	assert.False(t, ok, "the oldest entry is the one evicted")
+	assert.False(t, ok, "the oldest entries are the ones evicted")
+	_, ok = LoadAndDeleteRequestContext(fmt.Sprintf("live-%d", contextEvictionBatch-1))
+	assert.False(t, ok, "the whole oldest batch is evicted")
+	_, ok = LoadAndDeleteRequestContext(fmt.Sprintf("live-%d", contextEvictionBatch))
+	assert.True(t, ok, "entries beyond the batch survive")
 	_, ok = LoadAndDeleteRequestContext("newest")
 	assert.True(t, ok, "the new request must still be served")
+}
+
+// TestStoreRequestContext_EvictionIsAmortised verifies the requests following an
+// overflow are served from the headroom the batch freed, without evicting (and
+// therefore without scanning) again.
+func TestStoreRequestContext_EvictionIsAmortised(t *testing.T) {
+	clearContextStore()
+	defer clearContextStore()
+
+	now := time.Now()
+	requestContextMu.Lock()
+	for i := 0; i < MaxRequestContexts; i++ {
+		requestContextStore[fmt.Sprintf("live-%d", i)] = storedRequestContext{
+			ctx:      &RequestContext{Path: "/x"},
+			storedAt: now.Add(time.Duration(i) * time.Millisecond),
+		}
+	}
+	requestContextMu.Unlock()
+
+	StoreRequestContext("overflow", &RequestContext{Path: "/new"})
+	evictedAfterFirst := RequestContextsEvicted()
+	require.Equal(t, uint64(contextEvictionBatch), evictedAfterFirst)
+
+	// The batch freed contextEvictionBatch slots and one was consumed by the
+	// store above, so this many more fit without any further eviction.
+	for i := 0; i < contextEvictionBatch-1; i++ {
+		StoreRequestContext(fmt.Sprintf("after-%d", i), &RequestContext{Path: "/y"})
+	}
+
+	assert.Equal(t, evictedAfterFirst, RequestContextsEvicted(),
+		"requests within the freed headroom must not trigger another scan")
+	assert.Equal(t, MaxRequestContexts, RequestContextStoreSize())
 }
 
 // TestRequestContext_HoldsNoHeaders pins the property that made a leaked entry a
