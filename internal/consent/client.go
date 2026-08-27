@@ -20,6 +20,8 @@ package consent
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -125,8 +127,9 @@ type ClientConfig struct {
 // participant credentials of its own: the token service presents the
 // participant's verifiable credential and returns a short-lived token. GET
 // /participants/me then yields the provider selfDescriptionURL. Tokens are cached
-// package-wide (keyed by base URL + audience) and refreshed on expiry or a 401.
-// Access is allowed iff a returned consent is "granted".
+// package-wide (keyed by the full credential identity, see cacheKey) and
+// refreshed on expiry or a 401. Access is allowed iff a returned consent is
+// "granted".
 type Client struct {
 	baseURL         string
 	host            string
@@ -187,7 +190,46 @@ var (
 	credCache   = map[string]*cacheEntry{}
 )
 
-func (c *Client) cacheKey() string { return c.baseURL + "|" + c.tokenAudience }
+// credentialKeySeparator joins the components of a credential cache key. It is a
+// character that cannot occur in a URL or an audience name, so no two distinct
+// credential identities can produce the same joined key.
+const credentialKeySeparator = "\x00"
+
+// cacheKey identifies the credential the cached entry belongs to.
+//
+// The entry holds both the participant access token and the provider
+// self-description derived from it, so the key MUST cover every input that can
+// change either of them - otherwise two routes fronting different participants
+// but the same consent-manager share one entry, and whichever warms it first
+// makes the other run its identifier search scoped to the wrong provider and its
+// consents lookup as the wrong participant (silently wrong decisions in both
+// directions).
+//
+// Secrets are hashed rather than embedded so the key can be logged or ranged
+// over without leaking a token.
+func (c *Client) cacheKey() string {
+	return strings.Join([]string{
+		c.baseURL,
+		c.host,
+		c.apiPrefix,
+		c.tokenAudience,
+		c.tokenServiceURL,
+		c.providerSD,
+		hashSecret(c.staticToken),
+		hashSecret(c.consentKey),
+	}, credentialKeySeparator)
+}
+
+// hashSecret returns a stable, non-reversible fingerprint of a secret, so it can
+// distinguish cache identities without the secret itself being retained in the
+// key. An empty secret maps to the empty string.
+func hashSecret(secret string) string {
+	if secret == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(secret))
+	return hex.EncodeToString(sum[:])
+}
 
 // CheckConsent runs the two-call consent verification for req.Subject, allowing
 // when a granted consent exists and denying otherwise. An unknown subject is a

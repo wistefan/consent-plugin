@@ -491,3 +491,112 @@ func TestTruncateBody(t *testing.T) {
 	assert.Contains(t, long, "...(truncated)")
 	assert.Equal(t, maxBodyLogLength+len("...(truncated)"), len(long))
 }
+
+// TestCacheKeyDistinguishesCredentialIdentities verifies that two clients that
+// differ in any input feeding the cached token or provider self-description get
+// distinct cache keys. Sharing an entry across credential identities would make
+// one route run its lookups as the wrong participant (see cacheKey).
+func TestCacheKeyDistinguishesCredentialIdentities(t *testing.T) {
+	base := ClientConfig{
+		BaseURL:         "http://consent-manager:3000",
+		Host:            "consent.example.org",
+		APIPrefix:       "/v1",
+		ConsentKey:      "ck-a",
+		ProviderSD:      "http://facade/participants/a",
+		TokenServiceURL: "http://facade-a:8080/internal/tokens",
+		TokenAudience:   testAudience,
+	}
+
+	tests := []struct {
+		name   string
+		mutate func(cfg *ClientConfig)
+	}{
+		{"base url", func(cfg *ClientConfig) { cfg.BaseURL = "http://other-manager:3000" }},
+		{"host", func(cfg *ClientConfig) { cfg.Host = "other.example.org" }},
+		{"api prefix", func(cfg *ClientConfig) { cfg.APIPrefix = "/v2" }},
+		{"consent key", func(cfg *ClientConfig) { cfg.ConsentKey = "ck-b" }},
+		{"provider sd", func(cfg *ClientConfig) { cfg.ProviderSD = "http://facade/participants/b" }},
+		{"token service url", func(cfg *ClientConfig) { cfg.TokenServiceURL = "http://facade-b:8080/internal/tokens" }},
+		{"token audience", func(cfg *ClientConfig) { cfg.TokenAudience = "other-audience" }},
+		{"static token", func(cfg *ClientConfig) { cfg.ParticipantToken = "static-b" }},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			other := base
+			tc.mutate(&other)
+			assert.NotEqual(t, NewClient(base).cacheKey(), NewClient(other).cacheKey(),
+				"clients differing in %s must not share a credential cache entry", tc.name)
+		})
+	}
+
+	t.Run("identical config shares an entry", func(t *testing.T) {
+		assert.Equal(t, NewClient(base).cacheKey(), NewClient(base).cacheKey())
+	})
+
+	t.Run("secrets are not embedded verbatim", func(t *testing.T) {
+		withSecrets := base
+		withSecrets.ParticipantToken = "super-secret-token"
+		key := NewClient(withSecrets).cacheKey()
+		assert.NotContains(t, key, "super-secret-token")
+		assert.NotContains(t, key, "ck-a")
+	})
+}
+
+// TestCheckConsent_SeparateTokenServicesDoNotShareToken is the regression test
+// for the cross-participant cache collision: two routes fronting the SAME
+// consent-manager but authenticating through their own token service must each
+// present their own participant token.
+func TestCheckConsent_SeparateTokenServicesDoNotShareToken(t *testing.T) {
+	resetCredCache()
+
+	var mu sync.Mutex
+	var consentsAuth []string
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/users/identifier/search", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{"userIdentifier": "uid-1"})
+	})
+	mux.HandleFunc("/v1/consents/participants/", func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		consentsAuth = append(consentsAuth, r.Header.Get("Authorization"))
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"consents": []map[string]string{{"status": grantedStatus}},
+		})
+	})
+	consentManager := httptest.NewServer(mux)
+	t.Cleanup(consentManager.Close)
+
+	// One token service per participant, each minting a distinguishable token.
+	newTokenService := func(token string) *httptest.Server {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"access_token": token, "token_type": "Bearer", "expires_in": 3600,
+			})
+		}))
+		t.Cleanup(srv.Close)
+		return srv
+	}
+
+	for _, token := range []string{"token-participant-a", "token-participant-b"} {
+		c := NewClient(ClientConfig{
+			BaseURL:         consentManager.URL,
+			ConsentKey:      "ck",
+			ProviderSD:      "http://facade/participants/" + token,
+			TokenServiceURL: newTokenService(token).URL,
+			TokenAudience:   testAudience,
+		})
+		resp, err := c.CheckConsent(context.Background(), ConsentRequest{Subject: "did:key:z"})
+		require.NoError(t, err)
+		require.Equal(t, DecisionAllow, resp.Decision)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Equal(t, []string{"Bearer token-participant-a", "Bearer token-participant-b"}, consentsAuth,
+		"each participant must authenticate with its own token, not the first one cached")
+}
