@@ -1,0 +1,26 @@
+# OpenTelemetry Collector configuration for the local development stack.
+#
+# The plugin exports one OTLP/HTTP log record per checked data owner, marked with
+# resource service.name=consent-access-audit. This config shows the routing that
+# marker exists for: audit records go to their own pipeline, which in a real
+# deployment would be an append-only sink rather than the console.
+
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  batch: {}
+
+exporters:
+  debug:
+    verbosity: detailed
+
+service:
+  pipelines:
+    logs:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [debug]

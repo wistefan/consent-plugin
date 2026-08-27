@@ -24,6 +24,7 @@ package ownerresolver
 
 import (
 	"bytes"
+	"consent-plugin/internal/logging"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -34,8 +35,23 @@ import (
 
 // Body encodings understood by the resolver.
 const (
+	// encodingJSON carries the payload verbatim, parsed.
 	encodingJSON = "json"
+
+	// encodingNone means the response carried no payload at all.
 	encodingNone = "none"
+
+	// encodingOpaque means the response carried a payload the plugin could not
+	// parse as JSON.
+	//
+	// It exists because sending such a body as encodingNone made "this response
+	// carried a payload I could not read" indistinguishable from "this response
+	// had no payload". The resolver then judged ownership from the resource
+	// descriptor alone, so a malformed-but-personal payload — a truncated write,
+	// a content-type mismatch, an upstream answering XML or NDJSON on a route
+	// declared JSON — was released without ever being inspected. With the two
+	// cases separated the resolver can fail closed on the one it cannot read.
+	encodingOpaque = "opaque"
 
 	// DefaultTimeoutMs is the default per-call timeout for /resolve.
 	DefaultTimeoutMs = 2000
@@ -44,25 +60,34 @@ const (
 	contentTypeJSON = "application/json"
 )
 
-// Selector locates a claim within the payload (mirrors the resolver contract).
-type Selector struct {
-	Type  string `json:"type"`
-	Value string `json:"value,omitempty"`
-}
-
 // Claim is one (owner [× dataResource]) requirement found in the data.
+//
+// The resolver's reply carries more than this (a selector locating the claim in
+// the payload, the participant, the scheme). Only the fields the plugin acts on
+// are decoded; the rest is ignored, so an unread field cannot suggest the plugin
+// considers something it does not.
 type Claim struct {
-	Selector     Selector `json:"selector"`
-	OwnerID      string   `json:"ownerId"`
-	Participant  string   `json:"participant,omitempty"`
-	DataResource string   `json:"dataResource,omitempty"`
+	// OwnerID is the data owner whose consent decides this claim.
+	OwnerID string `json:"ownerId"`
+
+	// DataResource, when set, scopes the consent match to one resource.
+	DataResource string `json:"dataResource,omitempty"`
+
+	// Purpose names the processing purpose (or contract) governing this claim,
+	// when the resolver could identify the contract from the parties. It scopes
+	// the consent match: a granted consent counts only if it covers this purpose.
+	// Empty means the purpose is unknown and only the consumer match applies.
+	Purpose string `json:"purpose,omitempty"`
 }
 
 // Result is the OwnerResolver response.
 type Result struct {
-	ConsentRequired bool    `json:"consentRequired"`
-	Scheme          string  `json:"scheme,omitempty"`
-	Claims          []Claim `json:"claims"`
+	// ConsentRequired reports whether the payload needs a consent check at all.
+	ConsentRequired bool `json:"consentRequired"`
+
+	// Claims are the ownership requirements found in the data. Every one must be
+	// satisfied for the response to be released.
+	Claims []Claim `json:"claims"`
 }
 
 type resourceDescriptor struct {
@@ -73,8 +98,14 @@ type resourceDescriptor struct {
 }
 
 type bodyDescriptor struct {
-	Encoding string          `json:"encoding"`
-	Content  json.RawMessage `json:"content,omitempty"`
+	Encoding string `json:"encoding"`
+	// Content is the payload, present only for encodingJSON.
+	Content json.RawMessage `json:"content,omitempty"`
+	// ContentType is what the upstream declared, sent with encodingOpaque so the
+	// resolver knows what it was handed and how much it was.
+	ContentType string `json:"contentType,omitempty"`
+	// Size is the payload's length in bytes, sent with encodingOpaque.
+	Size int `json:"size,omitempty"`
 }
 
 // Parties names the exchange participants. It exists ONLY so the resolver can
@@ -122,17 +153,20 @@ type Resource struct {
 	ContentType string
 }
 
-// Resolve asks the OwnerResolver about a payload. payload may be nil, in which
-// case the body is sent with encoding "none" (the resolver decides from the
-// resource descriptor alone). consumer, when non-empty, is forwarded so the
-// resolver can find the governing contract - they are never used for ownership.
-// A non-2xx response is returned as an error so the caller can apply its fail
-// policy — it never means "no consent needed".
+// Resolve asks the OwnerResolver about a payload.
+//
+// The body is described in one of three ways, and the distinction matters:
+// "json" carries the payload, "none" says there was no payload, and "opaque"
+// says there WAS one but it could not be parsed. Collapsing the last two would
+// let an unreadable personal-data payload be judged from the resource descriptor
+// alone.
+//
+// The parties, when known, are forwarded so the resolver can find the governing
+// contract — they are never used for ownership. A non-2xx response is returned
+// as an error so the caller can apply its fail policy; it never means "no
+// consent needed".
 func (c *Client) Resolve(ctx context.Context, res Resource, p Parties, payload []byte) (Result, error) {
-	reqBody := &bodyDescriptor{Encoding: encodingNone}
-	if len(payload) > 0 && json.Valid(payload) {
-		reqBody = &bodyDescriptor{Encoding: encodingJSON, Content: json.RawMessage(payload)}
-	}
+	reqBody := describeBody(payload, res.ContentType)
 	req := resolveRequest{
 		Resource: resourceDescriptor(res),
 		Body:     reqBody,
@@ -162,7 +196,13 @@ func (c *Client) Resolve(ctx context.Context, res Resource, p Parties, payload [
 		return Result{}, fmt.Errorf("owner-resolver: read response: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return Result{}, fmt.Errorf("owner-resolver: status %d: %s", resp.StatusCode, truncate(body))
+		// The body goes to a debug log, not into the error: this error becomes the
+		// plugin's decision reason, which is exported to the audit sink and
+		// written to stdout, and a resolver error page can echo the payload it was
+		// given — which is the personal data the gate exists to protect.
+		logging.DebugfEvery("resolver-body",
+			"owner-resolver: status %d, body: %s", resp.StatusCode, logging.Sanitize(string(body)))
+		return Result{}, fmt.Errorf("owner-resolver: status %d", resp.StatusCode)
 	}
 
 	var out Result
@@ -172,10 +212,14 @@ func (c *Client) Resolve(ctx context.Context, res Resource, p Parties, payload [
 	return out, nil
 }
 
-func truncate(b []byte) string {
-	const limit = 256
-	if len(b) <= limit {
-		return string(b)
+// describeBody classifies the upstream payload for the resolve envelope.
+func describeBody(payload []byte, contentType string) *bodyDescriptor {
+	switch {
+	case len(payload) == 0:
+		return &bodyDescriptor{Encoding: encodingNone}
+	case json.Valid(payload):
+		return &bodyDescriptor{Encoding: encodingJSON, Content: json.RawMessage(payload)}
+	default:
+		return &bodyDescriptor{Encoding: encodingOpaque, ContentType: contentType, Size: len(payload)}
 	}
-	return string(b[:limit]) + "...(truncated)"
 }

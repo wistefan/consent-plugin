@@ -1,0 +1,40 @@
+# Dependency updates.
+#
+# The direct dependencies had drifted years behind (testify 1.8.4 while 1.12.1
+# was current) with nothing to notice. This makes the drift a pull request
+# instead of a review finding.
+#
+# The go-plugin-runner is deliberately grouped on its own: it is pinned at v0.5.0
+# and its transitive tree (zap 1.17, flatbuffers 2.0.0) is old, so an update to
+# it is a decision to make deliberately rather than merge with the batch. A
+# plugin whose runner is unmaintained is a strategic risk worth surfacing
+# regularly.
+version: 2
+updates:
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      go-dependencies:
+        patterns:
+          - "*"
+        exclude-patterns:
+          - "github.com/apache/apisix-go-plugin-runner"
+    labels:
+      - dependencies
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    labels:
+      - dependencies
+
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    labels:
+      - dependencies

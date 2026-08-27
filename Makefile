@@ -4,7 +4,7 @@
 BINARY_NAME := go-runner
 
 # Docker image configuration
-DOCKER_IMAGE := quay.io/wi_stefan/consent-plugin
+DOCKER_IMAGE := quay.io/seamware/consent-plugin
 DOCKER_TAG := 0.0.1
 
 # Go build flags
@@ -13,7 +13,11 @@ GO_BUILD_FLAGS := -trimpath -ldflags="-s -w"
 # Coverage output file
 COVERAGE_FILE := coverage.out
 
-.PHONY: build test test-cover lint license-check license-fix docker-build clean
+# Minimum total statement coverage, in percent. CI and `make test-cover` fail
+# below it, so a gap cannot reappear unnoticed.
+COVERAGE_FLOOR := 80
+
+.PHONY: build test test-cover coverage-floor lint license-check license-fix docker-build clean
 
 ## build: Compile the go-runner binary
 build:
@@ -23,10 +27,18 @@ build:
 test:
 	go test -race ./...
 
-## test-cover: Run tests with coverage report
+## test-cover: Run tests with coverage report and enforce the floor
+# -coverpkg=./... is required: without it the integration package's coverage of
+# internal/plugin is discarded, which understated the real figure and made the
+# genuinely untested functions look like measurement noise.
 test-cover:
-	go test -race -coverprofile=$(COVERAGE_FILE) ./...
+	go test -race -coverpkg=./... -coverprofile=$(COVERAGE_FILE) ./...
 	go tool cover -func=$(COVERAGE_FILE)
+	./hack/coverage-floor.sh $(COVERAGE_FILE) $(COVERAGE_FLOOR)
+
+## coverage-floor: Assert an existing coverage profile meets COVERAGE_FLOOR
+coverage-floor:
+	./hack/coverage-floor.sh $(COVERAGE_FILE) $(COVERAGE_FLOOR)
 
 ## lint: Run golangci-lint
 lint:
