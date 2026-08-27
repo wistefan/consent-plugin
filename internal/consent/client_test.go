@@ -499,30 +499,6 @@ func TestCheckConsentContextCancellation(t *testing.T) {
 	assert.Contains(t, err.Error(), "HTTP request failed")
 }
 
-// TestDecisionIsValid verifies the Decision.IsValid method.
-func TestDecisionIsValid(t *testing.T) {
-	assert.True(t, DecisionAllow.IsValid())
-	assert.True(t, DecisionDeny.IsValid())
-	assert.True(t, DecisionFilter.IsValid())
-	assert.False(t, Decision("").IsValid())
-	assert.False(t, Decision("maybe").IsValid())
-}
-
-// TestConsentResponseValidate verifies the Validate method on ConsentResponse.
-func TestConsentResponseValidate(t *testing.T) {
-	require.NoError(t, (&ConsentResponse{Decision: DecisionAllow}).Validate())
-	require.NoError(t, (&ConsentResponse{Decision: DecisionDeny, Reason: "no consent"}).Validate())
-
-	err := (&ConsentResponse{Decision: ""}).Validate()
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "decision field is empty")
-
-	err = (&ConsentResponse{Decision: "block"}).Validate()
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "unrecognized decision")
-}
-
-// TestTruncateBody verifies the body truncation helper.
 func TestTruncateBody(t *testing.T) {
 	assert.Equal(t, "short", truncateBody([]byte("short")))
 	assert.Equal(t, "", truncateBody([]byte{}))

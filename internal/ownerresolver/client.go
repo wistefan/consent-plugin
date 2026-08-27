@@ -44,18 +44,19 @@ const (
 	contentTypeJSON = "application/json"
 )
 
-// Selector locates a claim within the payload (mirrors the resolver contract).
-type Selector struct {
-	Type  string `json:"type"`
-	Value string `json:"value,omitempty"`
-}
-
 // Claim is one (owner [× dataResource]) requirement found in the data.
+//
+// The resolver's reply carries more than this (a selector locating the claim in
+// the payload, the participant, the scheme). Only the fields the plugin acts on
+// are decoded; the rest is ignored, so an unread field cannot suggest the plugin
+// considers something it does not.
 type Claim struct {
-	Selector     Selector `json:"selector"`
-	OwnerID      string   `json:"ownerId"`
-	Participant  string   `json:"participant,omitempty"`
-	DataResource string   `json:"dataResource,omitempty"`
+	// OwnerID is the data owner whose consent decides this claim.
+	OwnerID string `json:"ownerId"`
+
+	// DataResource, when set, scopes the consent match to one resource.
+	DataResource string `json:"dataResource,omitempty"`
+
 	// Purpose names the processing purpose (or contract) governing this claim,
 	// when the resolver could identify the contract from the parties. It scopes
 	// the consent match: a granted consent counts only if it covers this purpose.
@@ -65,9 +66,12 @@ type Claim struct {
 
 // Result is the OwnerResolver response.
 type Result struct {
-	ConsentRequired bool    `json:"consentRequired"`
-	Scheme          string  `json:"scheme,omitempty"`
-	Claims          []Claim `json:"claims"`
+	// ConsentRequired reports whether the payload needs a consent check at all.
+	ConsentRequired bool `json:"consentRequired"`
+
+	// Claims are the ownership requirements found in the data. Every one must be
+	// satisfied for the response to be released.
+	Claims []Claim `json:"claims"`
 }
 
 type resourceDescriptor struct {
