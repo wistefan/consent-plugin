@@ -27,8 +27,10 @@ services:
   apisix:
     image: apache/apisix:3.8.0-debian
     depends_on:
-      - etcd
-      - plugin-runner
+      etcd:
+        condition: service_started
+      plugin-runner:
+        condition: service_healthy
     ports:
       - "9080:9080"   # HTTP proxy port
       - "9180:9180"   # Admin API port
@@ -37,10 +39,21 @@ services:
       - runner-socket:/opt/runner
     restart: on-failure
 
+  # A named volume is created root-owned, and the runner image runs as uid 10001,
+  # so hand the socket directory over before the runner starts.
+  socket-init:
+    image: alpine:3.22
+    command: ["chown", "10001:10001", "/opt/runner"]
+    volumes:
+      - runner-socket:/opt/runner
+
   plugin-runner:
     build:
       context: .
       dockerfile: Dockerfile
+    depends_on:
+      socket-init:
+        condition: service_completed_successfully
     volumes:
       - runner-socket:/opt/runner
     environment:
