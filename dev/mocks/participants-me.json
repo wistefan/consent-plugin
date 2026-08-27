@@ -1,0 +1,9 @@
+{
+  "//": "GET /participants/me — the provider self-description the identifier search is scoped by.",
+  "request": { "method": "GET", "url": "/v1/participants/me" },
+  "response": {
+    "status": 200,
+    "headers": { "Content-Type": "application/json" },
+    "jsonBody": { "selfDescriptionURL": "http://mock:8080/participants/dev-provider" }
+  }
+}

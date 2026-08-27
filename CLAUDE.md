@@ -62,7 +62,11 @@ consent-plugin/
 │   │   └── extractor_test.go  # Unit tests for JWT extraction
 │   └── integration/
 │       └── integration_test.go # End-to-end plugin lifecycle tests
-└── docker-compose.yaml        # Local dev with APISIX + plugin runner
+├── dev/
+│   ├── apisix-config.yaml     # APISIX config for the local stack (ext-plugin wiring)
+│   ├── otel-collector.yaml    # Collector config receiving the audit log
+│   └── mocks/                 # WireMock stubs: consent-manager, OwnerResolver, token service
+└── docker-compose.yaml        # Local dev with APISIX + plugin runner + mocks
 ```
 
 ## Build & Test

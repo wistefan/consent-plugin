@@ -1,0 +1,41 @@
+# APISIX configuration for the local development stack (docker-compose.yaml).
+#
+# The only part specific to this project is `ext-plugin.path_for_test`, which
+# points APISIX at the unix socket the plugin-runner container binds. The two
+# containers share it through the `runner-socket` volume: the socket must live in
+# a shared DIRECTORY, because bind-mounting the socket file itself makes Docker
+# create a directory at that path before either process can bind it.
+
+apisix:
+  node_listen: 9080
+  enable_admin: true
+  proxy_mode: http
+
+deployment:
+  role: traditional
+  role_traditional:
+    config_provider: etcd
+  admin:
+    admin_key:
+      - name: admin
+        # Development only. Never reuse this key outside the local stack.
+        key: edd1c9f034335f136f87ad84b625c8f1
+        role: admin
+    allow_admin:
+      - 0.0.0.0/0
+    admin_listen:
+      port: 9180
+  etcd:
+    host:
+      - "http://etcd:2379"
+    prefix: /apisix
+    timeout: 30
+
+ext-plugin:
+  # The runner is started by its own container, not by APISIX, so APISIX only
+  # needs to know where to reach it.
+  path_for_test: /opt/runner/runner.sock
+
+plugins:
+  - ext-plugin-pre-req
+  - ext-plugin-post-resp

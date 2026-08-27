@@ -2,10 +2,16 @@
 #
 # Usage:
 #   docker compose up --build
+#   # then create the gated route (see README, "Local Development with Docker Compose")
 #
-# This starts APISIX with etcd and the Go plugin runner sidecar.
-
-version: "3.8"
+# The stack is self-contained: APISIX and its etcd, the plugin runner, a mock
+# consent-manager + OwnerResolver + token service, an upstream that returns
+# personal data, and an OTel Collector to receive the access-decision audit log.
+#
+# Note the socket wiring. APISIX and the runner share a DIRECTORY (the
+# runner-socket volume) and the socket is created inside it. Bind-mounting the
+# socket file itself does not work: Docker creates a directory at that path
+# before either process can bind, and the runner then fails to start.
 
 services:
   etcd:
@@ -22,12 +28,13 @@ services:
     image: apache/apisix:3.8.0-debian
     depends_on:
       - etcd
+      - plugin-runner
     ports:
       - "9080:9080"   # HTTP proxy port
       - "9180:9180"   # Admin API port
     volumes:
-      - ./apisix-config.yaml:/usr/local/apisix/conf/config.yaml:ro
-      - /tmp/runner.sock:/tmp/runner.sock
+      - ./dev/apisix-config.yaml:/usr/local/apisix/conf/config.yaml:ro
+      - runner-socket:/opt/runner
     restart: on-failure
 
   plugin-runner:
@@ -35,7 +42,40 @@ services:
       context: .
       dockerfile: Dockerfile
     volumes:
-      - /tmp/runner.sock:/tmp/runner.sock
+      - runner-socket:/opt/runner
     environment:
-      APISIX_LISTEN_ADDRESS: "unix:/tmp/runner.sock"
+      APISIX_LISTEN_ADDRESS: "unix:/opt/runner/runner.sock"
+      # Credentials the plugin reads from the environment rather than the route
+      # config, mirroring how the Kubernetes deployment sources them from a Secret.
+      CONSENT_KEY: "dev-consent-key"
+      CONSENT_TOKEN_SERVICE_URL: "http://mock:8080/internal/tokens"
+      CONSENT_AUDIT_OTLP_ENDPOINT: "http://otel-collector:4318"
     restart: on-failure
+
+  # Mock consent-manager, OwnerResolver and participant token service. The
+  # stubs live in dev/mocks/ — edit consents.json to flip the gate's answer.
+  mock:
+    image: wiremock/wiremock:3.9.1
+    command: ["--port", "8080", "--verbose"]
+    volumes:
+      - ./dev/mocks:/home/wiremock/mappings:ro
+    ports:
+      - "8081:8080"
+
+  # The upstream whose responses are gated. It echoes the request back as JSON,
+  # which is enough for the OwnerResolver stub to be asked about a payload.
+  upstream:
+    image: mendhak/http-https-echo:34
+    environment:
+      HTTP_PORT: "8080"
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.109.0
+    command: ["--config=/etc/otel-collector.yaml"]
+    volumes:
+      - ./dev/otel-collector.yaml:/etc/otel-collector.yaml:ro
+    ports:
+      - "4318:4318"
+
+volumes:
+  runner-socket:

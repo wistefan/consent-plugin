@@ -194,11 +194,46 @@ make lint          # golangci-lint
 docker compose up --build
 ```
 
+The stack is self-contained — APISIX + etcd, the plugin runner, a mock
+consent-manager / OwnerResolver / token service, an echo upstream, and an OTel
+Collector for the audit log:
+
 | Service | Description | Ports |
 |---------|-------------|-------|
 | `etcd` | APISIX configuration store | `2379` |
 | `apisix` | APISIX gateway | `9080` (HTTP), `9180` (Admin API) |
-| `plugin-runner` | consent-filter plugin runner | — (Unix socket) |
+| `plugin-runner` | consent-filter plugin runner | — (unix socket, shared volume) |
+| `mock` | consent-manager + OwnerResolver + token service stubs (`dev/mocks/`) | `8081` |
+| `upstream` | echo service standing in for the personal-data API | — |
+| `otel-collector` | receives the access-decision audit log | `4318` |
+
+Then create the gated route:
+
+```bash
+PLUGIN_CONF='{"consent_api_url":"http://mock:8080","owner_resolver_url":"http://mock:8080/resolve","token_service_url":"http://mock:8080/internal/tokens","consent_key":"dev-consent-key","service":"dev-profiles","fail_open":false}'
+
+jq -n --arg conf "$PLUGIN_CONF" '{
+  uri: "/*",
+  upstream: { type: "roundrobin", nodes: { "upstream:8080": 1 } },
+  plugins: {
+    "ext-plugin-pre-req":   { conf: [ { name: "consent-filter", value: $conf } ] },
+    "ext-plugin-post-resp": { conf: [ { name: "consent-filter", value: $conf } ] }
+  }
+}' | curl -s -X PUT http://127.0.0.1:9180/apisix/admin/routes/1 \
+  -H "X-API-KEY: edd1c9f034335f136f87ad84b625c8f1" -H "Content-Type: application/json" -d @-
+
+# The token names the consumer the mock's consent was granted to, so this passes.
+TOKEN_PAYLOAD=$(printf '{"verifiableCredential":{"issuer":"did:key:zDevConsumer"}}' | base64 -w0 | tr '+/' '-_' | tr -d '=')
+curl -i http://127.0.0.1:9080/profile -H "Authorization: Bearer e30.${TOKEN_PAYLOAD}.nosig"
+```
+
+Change the `consumer` in `dev/mocks/consents.json` (or the `status` to
+`revoked`) and restart the `mock` service to watch the same request be denied.
+The `otel-collector` logs show the audit record for each decision.
+
+> The socket is shared through a **directory** (the `runner-socket` volume), not
+> by bind-mounting the socket file: Docker creates a directory at a bind-mount
+> path that does not exist yet, and the runner then cannot bind.
 
 ## Project Structure
 
