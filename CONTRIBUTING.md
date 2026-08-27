@@ -1,5 +1,10 @@
 # Contributing
 
+## Reporting a vulnerability
+
+Do not open a public issue. See [SECURITY.md](SECURITY.md) — this plugin decides
+whether personal data is released, so a defect in it is handled privately first.
+
 ## Pull requests
 
 - Target the `main` branch.
