@@ -20,10 +20,13 @@ package plugin
 import (
 	"consent-plugin/internal/audit"
 	"consent-plugin/internal/ownerresolver"
+	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -124,6 +127,9 @@ type mockResponse struct {
 	// suppressContentTypeVar makes Var() report no upstream Content-Type, to
 	// exercise the header fallback.
 	suppressContentTypeVar bool
+	// suppressRequestIDVar makes Var() report no $request_id, as happens when the
+	// two phases cannot be correlated.
+	suppressRequestIDVar bool
 }
 
 // newMockResponse builds a JSON upstream response carrying body.
@@ -145,6 +151,9 @@ func (r *mockResponse) Header() pkgHTTP.Header {
 func (r *mockResponse) Var(name string) ([]byte, error) {
 	switch name {
 	case nginxRequestIDVar:
+		if r.suppressRequestIDVar {
+			return nil, nil
+		}
 		return []byte(testReqKey(r.id)), nil
 	case nginxUpstreamContentTypeVar:
 		if r.suppressContentTypeVar {
@@ -1193,4 +1202,95 @@ func TestResponseFilter_BodyCapDenies(t *testing.T) {
 
 	assert.Equal(t, DefaultDenyStatusCode, resp.writtenStatus,
 		"a body too large to examine must be denied, not forwarded")
+}
+
+// TestResponseFilter_CorrelationIdMissingInOnerPhase verifies the case where the
+// two phases cannot be correlated: the request phase stored nothing (or the
+// response phase cannot read $request_id), so there is no context to decide on.
+// The plugin is structurally unable to gate here, so it must deny even with
+// fail_open — this is not an outage to ride out.
+func TestResponseFilter_CorrelationIDMissingInOnePhase(t *testing.T) {
+	server := newUncalledConsentManager(t)
+	defer server.Close()
+	resolver := newUncalledOwnerResolver(t)
+	defer resolver.Close()
+
+	cfg := newTestConfig(server.URL, resolver.URL+"/resolve")
+	cfg.FailOpen = boolPtr(true)
+
+	t.Run("response phase cannot read the correlation id", func(t *testing.T) {
+		clearContextStore()
+		resp := newMockResponse(260, []byte(`{}`))
+		resp.suppressRequestIDVar = true
+		storeRequest(260)
+
+		(&ConsentFilter{}).ResponseFilter(cfg, resp)
+
+		assert.Equal(t, DefaultDenyStatusCode, resp.writtenStatus,
+			"without a correlation id the phases cannot be matched, so nothing can be verified")
+	})
+
+	t.Run("request phase never stored a context", func(t *testing.T) {
+		clearContextStore()
+		resp := newMockResponse(261, []byte(`{}`))
+
+		(&ConsentFilter{}).ResponseFilter(cfg, resp)
+
+		assert.Equal(t, DefaultDenyStatusCode, resp.writtenStatus,
+			"a response whose request phase left no context must not be released")
+	})
+}
+
+// mockRequest implements pkgHTTP.Request. correlationID is what Var() reports
+// for $request_id; empty means the variable is unavailable.
+type mockRequest struct {
+	header        *mockHeader
+	correlationID string
+}
+
+func (r *mockRequest) ID() uint32             { return 1 }
+func (r *mockRequest) SrcIP() net.IP          { return net.ParseIP("127.0.0.1") }
+func (r *mockRequest) Method() string         { return "GET" }
+func (r *mockRequest) Path() []byte           { return []byte("/data") }
+func (r *mockRequest) SetPath([]byte)         {}
+func (r *mockRequest) Header() pkgHTTP.Header { return r.header }
+func (r *mockRequest) Args() url.Values       { return nil }
+func (r *mockRequest) Var(name string) ([]byte, error) {
+	if name == nginxRequestIDVar && r.correlationID != "" {
+		return []byte(r.correlationID), nil
+	}
+	return nil, nil
+}
+func (r *mockRequest) Body() ([]byte, error)    { return nil, nil }
+func (r *mockRequest) Context() context.Context { return context.Background() }
+func (r *mockRequest) RespHeader() http.Header  { return nil }
+
+// TestRequestFilter_CorrelationID verifies the request phase stores a context
+// only when it can be correlated with the response phase. Storing one it could
+// never retrieve would leak an entry per request into the context store.
+func TestRequestFilter_CorrelationID(t *testing.T) {
+	cfg := newTestConfig("http://consent.invalid", "http://resolver.invalid/resolve")
+
+	t.Run("no correlation id stores nothing", func(t *testing.T) {
+		clearContextStore()
+		req := &mockRequest{header: newMockHeader()}
+
+		(&ConsentFilter{}).RequestFilter(cfg, httptest.NewRecorder(), req)
+
+		assert.Equal(t, 0, RequestContextStoreSize(),
+			"a context that could never be correlated must not be stored")
+	})
+
+	t.Run("a correlation id stores the context", func(t *testing.T) {
+		clearContextStore()
+		defer clearContextStore()
+		req := &mockRequest{header: newMockHeader(), correlationID: "req-abc"}
+
+		(&ConsentFilter{}).RequestFilter(cfg, httptest.NewRecorder(), req)
+
+		stored, found := LoadAndDeleteRequestContext("req-abc")
+		require.True(t, found)
+		assert.Equal(t, "/data", stored.Path)
+		assert.Equal(t, "GET", stored.Method)
+	})
 }
