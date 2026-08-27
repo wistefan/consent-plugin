@@ -90,6 +90,12 @@ var errParticipantUnauthorized = errors.New("consent client: participant token u
 // mistyped route config becomes a silent, total bypass of the gate.
 var ErrNoCredentials = errors.New("consent client: no participant_token and no token_service_url configured")
 
+// ErrParticipantNotRegistered signals that the participant registry answered and
+// holds no participant for the requested DID. Like ErrNoCredentials it is a
+// permanent condition rather than an outage: retrying will not fix it, so
+// callers must not treat it as a transient error to be failed open on.
+var ErrParticipantNotRegistered = errors.New("consent client: participant not registered")
+
 // ClientConfig holds everything needed to verify consent against the
 // (Prometheus-X / Visions) consent-manager.
 type ClientConfig struct {
@@ -424,7 +430,7 @@ func (c *Client) ParticipantSelfDescriptionByDID(ctx context.Context, did string
 	participantSDMu.Unlock()
 	if hit && time.Now().Before(entry.expiry) {
 		if entry.unknown {
-			return "", fmt.Errorf("consent client: no participant registered for did %q", did)
+			return "", notRegistered(did)
 		}
 		return entry.selfDescriptionURL, nil
 	}
@@ -452,9 +458,15 @@ func (c *Client) ParticipantSelfDescriptionByDID(ctx context.Context, did string
 	participantSDMu.Unlock()
 
 	if sd == "" {
-		return "", fmt.Errorf("consent client: no participant registered for did %q", did)
+		return "", notRegistered(did)
 	}
 	return sd, nil
+}
+
+// notRegistered builds the "no such participant" error, wrapping the sentinel so
+// callers can tell a misconfigured DID from an unreachable registry.
+func notRegistered(did string) error {
+	return fmt.Errorf("%w: no participant registered for did %q", ErrParticipantNotRegistered, did)
 }
 
 // lookupParticipantSD fetches the participant registry and returns the

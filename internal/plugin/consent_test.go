@@ -493,9 +493,11 @@ func TestConsentFilter_ResponseFilter(t *testing.T) {
 					},
 				})
 			},
-			consentServer:     newUncalledConsentManager,
-			resolverServer:    newUncalledOwnerResolver,
-			configFn:          func(cfg *Config) { cfg.FailOpen = boolPtr(false) },
+			consentServer:  newUncalledConsentManager,
+			resolverServer: newUncalledOwnerResolver,
+			// A consumer that is not in the registry is a permanent condition, so
+			// fail_open must not grant it standing access.
+			configFn:          func(cfg *Config) { cfg.FailOpen = boolPtr(true) },
 			wantWrittenBody:   DefaultDenyResponseBody,
 			wantWrittenStatus: DefaultDenyStatusCode,
 		},

@@ -392,11 +392,13 @@ func failOutcome(cfg *Config, mode failMode, reason, requestID string, req *cons
 	return o
 }
 
-// failModeForError maps a dependency error to its fail mode: a missing
-// credential is a misconfiguration that must never be failed open on, anything
+// failModeForError maps a dependency error to its fail mode. A missing
+// credential or a consumer that is not in the participant registry is a
+// permanent misconfiguration: retrying will not fix it, so failing it open would
+// not ride out an outage, it would grant that consumer standing access. Anything
 // else is treated as an outage the operator's policy governs.
 func failModeForError(err error) failMode {
-	if errors.Is(err, consent.ErrNoCredentials) {
+	if errors.Is(err, consent.ErrNoCredentials) || errors.Is(err, consent.ErrParticipantNotRegistered) {
 		return failAlwaysClosed
 	}
 	return failByPolicy
