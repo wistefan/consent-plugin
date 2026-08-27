@@ -13,6 +13,12 @@ The plugin is attached to a route in **both** external-plugin phases:
 
 The decision is a coarse allow/deny and is **independent of the response body's shape**, so an empty or non-JSON personal-data response is still gated.
 
+The payload is described to the resolver in one of three ways — `json` (parsed
+and carried), `none` (there was no payload), and `opaque` (there was one but it
+could not be parsed, sent with its declared content type and size). The last two
+are deliberately distinct: an unreadable personal-data payload must not look to
+the resolver like no payload at all.
+
 > The `$request_id` correlation is required: `ext-plugin-pre-req` and `ext-plugin-post-resp` are separate RPCs to the runner and do **not** share the runner's per-call `ID()`.
 
 ### Ownership comes from the data, never from the requestor

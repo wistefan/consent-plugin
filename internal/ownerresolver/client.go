@@ -34,8 +34,23 @@ import (
 
 // Body encodings understood by the resolver.
 const (
+	// encodingJSON carries the payload verbatim, parsed.
 	encodingJSON = "json"
+
+	// encodingNone means the response carried no payload at all.
 	encodingNone = "none"
+
+	// encodingOpaque means the response carried a payload the plugin could not
+	// parse as JSON.
+	//
+	// It exists because sending such a body as encodingNone made "this response
+	// carried a payload I could not read" indistinguishable from "this response
+	// had no payload". The resolver then judged ownership from the resource
+	// descriptor alone, so a malformed-but-personal payload — a truncated write,
+	// a content-type mismatch, an upstream answering XML or NDJSON on a route
+	// declared JSON — was released without ever being inspected. With the two
+	// cases separated the resolver can fail closed on the one it cannot read.
+	encodingOpaque = "opaque"
 
 	// DefaultTimeoutMs is the default per-call timeout for /resolve.
 	DefaultTimeoutMs = 2000
@@ -82,8 +97,14 @@ type resourceDescriptor struct {
 }
 
 type bodyDescriptor struct {
-	Encoding string          `json:"encoding"`
-	Content  json.RawMessage `json:"content,omitempty"`
+	Encoding string `json:"encoding"`
+	// Content is the payload, present only for encodingJSON.
+	Content json.RawMessage `json:"content,omitempty"`
+	// ContentType is what the upstream declared, sent with encodingOpaque so the
+	// resolver knows what it was handed and how much it was.
+	ContentType string `json:"contentType,omitempty"`
+	// Size is the payload's length in bytes, sent with encodingOpaque.
+	Size int `json:"size,omitempty"`
 }
 
 // Parties names the exchange participants. It exists ONLY so the resolver can
@@ -131,17 +152,20 @@ type Resource struct {
 	ContentType string
 }
 
-// Resolve asks the OwnerResolver about a payload. payload may be nil, in which
-// case the body is sent with encoding "none" (the resolver decides from the
-// resource descriptor alone). consumer, when non-empty, is forwarded so the
-// resolver can find the governing contract - they are never used for ownership.
-// A non-2xx response is returned as an error so the caller can apply its fail
-// policy — it never means "no consent needed".
+// Resolve asks the OwnerResolver about a payload.
+//
+// The body is described in one of three ways, and the distinction matters:
+// "json" carries the payload, "none" says there was no payload, and "opaque"
+// says there WAS one but it could not be parsed. Collapsing the last two would
+// let an unreadable personal-data payload be judged from the resource descriptor
+// alone.
+//
+// The parties, when known, are forwarded so the resolver can find the governing
+// contract — they are never used for ownership. A non-2xx response is returned
+// as an error so the caller can apply its fail policy; it never means "no
+// consent needed".
 func (c *Client) Resolve(ctx context.Context, res Resource, p Parties, payload []byte) (Result, error) {
-	reqBody := &bodyDescriptor{Encoding: encodingNone}
-	if len(payload) > 0 && json.Valid(payload) {
-		reqBody = &bodyDescriptor{Encoding: encodingJSON, Content: json.RawMessage(payload)}
-	}
+	reqBody := describeBody(payload, res.ContentType)
 	req := resolveRequest{
 		Resource: resourceDescriptor(res),
 		Body:     reqBody,
@@ -179,6 +203,18 @@ func (c *Client) Resolve(ctx context.Context, res Resource, p Parties, payload [
 		return Result{}, fmt.Errorf("owner-resolver: decode response: %w", err)
 	}
 	return out, nil
+}
+
+// describeBody classifies the upstream payload for the resolve envelope.
+func describeBody(payload []byte, contentType string) *bodyDescriptor {
+	switch {
+	case len(payload) == 0:
+		return &bodyDescriptor{Encoding: encodingNone}
+	case json.Valid(payload):
+		return &bodyDescriptor{Encoding: encodingJSON, Content: json.RawMessage(payload)}
+	default:
+		return &bodyDescriptor{Encoding: encodingOpaque, ContentType: contentType, Size: len(payload)}
+	}
 }
 
 func truncate(b []byte) string {
