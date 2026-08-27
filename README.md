@@ -143,6 +143,17 @@ route config; a value in the config always wins. The plugin runner inherits thes
 from the APISIX container, which sources them from a Kubernetes Secret — so
 secrets need not be stored as plaintext in the route config (etcd).
 
+**Metrics.** Set the `CONSENT_METRICS_ADDRESS` environment variable on the
+plugin runner (e.g. `:9091`) to expose Prometheus metrics on `/metrics`:
+`consent_decisions_total{decision,fail_mode}` (a deny caused by an outage is
+labelled apart from one caused by consent),
+`consent_dependency_calls_total{dependency,outcome}`,
+`consent_dependency_duration_seconds{dependency}`,
+`consent_request_context_store_size`, `consent_request_contexts_evicted_total`
+and `consent_audit_events_dropped_total`. Metrics are off unless the variable is
+set — the runner is otherwise reached only over its unix socket, so opening a
+TCP port is the deployment's decision.
+
 **Access audit log.** With `audit_enabled`, the plugin emits one OTLP/HTTP **log record** per **checked data owner** (so the log answers whose consent was consulted and what each said, not merely whether the response was released; a request that failed before any owner was reached is recorded once as itself) to `audit_otlp_endpoint`, stamped with resource `service.name=<audit_service_name>` and attributes `event.domain=audit`, `consent.decision`, `consent.reason`, `enduser.id`, `http.request.method`, `url.path`, `http.request.id`. Emission is asynchronous, batched, and best-effort (a bounded queue drops rather than blocking the request path), so a slow/absent Collector never affects data access. The queue is flushed on `SIGTERM`/`SIGINT`, so a redeploy does not discard the last flush interval of decisions. Reasons are sanitised before export (control characters collapsed, length bounded) so an upstream error body cannot reach the audit sink verbatim. Mark-based routing lets the Collector send these to an append-only audit sink separate from traces.
 
 ## APISIX Route Configuration Example

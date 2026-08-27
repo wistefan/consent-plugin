@@ -32,6 +32,7 @@ import (
 	"consent-plugin/internal/consent"
 	"consent-plugin/internal/jwt"
 	"consent-plugin/internal/logging"
+	"consent-plugin/internal/metrics"
 	"consent-plugin/internal/ownerresolver"
 	"context"
 	"errors"
@@ -198,6 +199,10 @@ type responseOutcome struct {
 	resource  string
 	method    string
 	checked   []checkedOwner
+	// failMode names why the decision could not be reached normally, so a deny
+	// caused by an outage is not counted as a deny caused by consent. Empty for
+	// an ordinary consent verdict.
+	failMode string
 }
 
 // checkedOwner is one data owner's consent decision within a response.
@@ -237,6 +242,7 @@ func (c *ConsentFilter) ResponseFilter(conf interface{}, w pkgHTTP.Response) {
 	}
 
 	outcome := c.evaluate(cfg, w)
+	metrics.RecordDecision(outcome.decision, outcome.failMode)
 	recordAudit(cfg, outcome)
 	if outcome.decision == decisionDeny {
 		denyResponse(w, cfg)
@@ -325,12 +331,14 @@ func (c *ConsentFilter) evaluateWithResolver(cfg *Config, w pkgHTTP.Response, ke
 	resolveParties.Provider = providerSD
 
 	resolverClient := ownerresolver.NewClient(cfg.OwnerResolverURL, cfg.OwnerResolverTimeout)
+	resolveStarted := time.Now()
 	result, err := resolverClient.Resolve(phaseCtx, ownerresolver.Resource{
 		Service:     cfg.Service,
 		Method:      reqCtx.Method,
 		Path:        reqCtx.Path,
 		ContentType: contentType,
 	}, resolveParties, body)
+	metrics.RecordDependencyCall(metrics.DependencyOwnerResolver, outcomeOf(err), time.Since(resolveStarted))
 	if err != nil {
 		logging.ErrorfEvery("resolver-error", "ResponseFilter: owner resolver error for request %s: %s", key, logging.Sanitize(err.Error()))
 		return failOutcome(cfg, failByPolicy, "owner resolver error: "+err.Error(), key, nil)
@@ -388,6 +396,14 @@ func distinctClaims(claims []ownerresolver.Claim) ([]ownerClaim, error) {
 	return distinct, nil
 }
 
+// outcomeOf maps a call's error to the metric's outcome label.
+func outcomeOf(err error) string {
+	if err != nil {
+		return metrics.OutcomeError
+	}
+	return metrics.OutcomeSuccess
+}
+
 // maxConcurrentConsentChecks bounds how many per-owner checks are in flight at
 // once. Serial checks made the response latency the sum of every owner's; an
 // unbounded fan-out would instead make one response a burst against the
@@ -442,7 +458,9 @@ func checkOwners(ctx context.Context, cfg *Config, key string, reqCtx *RequestCo
 			results[i].request = req
 			ownerResource := resourceOrPath(claim.dataResource, reqCtx.Path)
 
+			started := time.Now()
 			resp, err := client.CheckConsent(checksCtx, req)
+			metrics.RecordDependencyCall(metrics.DependencyConsentManager, outcomeOf(err), time.Since(started))
 			switch {
 			case err != nil:
 				results[i].err = err
@@ -549,6 +567,14 @@ const (
 	failAlwaysClosed
 )
 
+// String names the fail mode for metrics and logs.
+func (m failMode) String() string {
+	if m == failAlwaysClosed {
+		return "always_closed"
+	}
+	return "by_policy"
+}
+
 // failOutcome builds the outcome for an unresolved consent check. mode decides
 // whether the operator's fail policy applies at all. req may be nil when no
 // request context was captured.
@@ -557,7 +583,7 @@ func failOutcome(cfg *Config, mode failMode, reason, requestID string, req *cons
 	if mode == failByPolicy && cfg.IsFailOpen() {
 		decision = decisionAllow
 	}
-	o := responseOutcome{decision: decision, reason: reason, requestID: requestID}
+	o := responseOutcome{decision: decision, reason: reason, requestID: requestID, failMode: mode.String()}
 	if req != nil {
 		o.subject = req.Subject
 		o.resource = req.Resource

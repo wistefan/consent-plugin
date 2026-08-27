@@ -54,6 +54,9 @@ consent-plugin/
 │   ├── audit/
 │   │   ├── audit.go           # OTLP/HTTP access-decision audit exporter
 │   │   └── audit_test.go      # Unit tests for the audit exporter
+│   ├── metrics/
+│   │   ├── metrics.go         # Prometheus text-format exporter (decisions, latency, gauges)
+│   │   └── metrics_test.go    # Unit tests for the exporter
 │   ├── logging/
 │   │   ├── logging.go         # Leveled logging front end: redaction, sanitisation, rate limiting
 │   │   └── logging_test.go    # Unit tests for the logging front end
@@ -121,6 +124,9 @@ make docker-build
   the two-call check (`/users/identifier/search` + `/consents/participants/{id}`).
   A consent counts only if it is granted **to the named consumer** (and covers
   the purpose/resource when known).
+- `internal/metrics/metrics.go` — Hand-rolled Prometheus exporter (no client
+  dependency, like the OTLP encoder). Served from `main.go` on
+  `CONSENT_METRICS_ADDRESS` when set.
 - `internal/logging/logging.go` — Logging front end over the runner's zap logger:
   `Redact` fingerprints identifiers, `Sanitize` strips error bodies, and the
   `*Every` variants rate-limit a repeated failure to one line per interval.

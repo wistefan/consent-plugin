@@ -19,6 +19,7 @@ package plugin
 
 import (
 	"consent-plugin/internal/logging"
+	"consent-plugin/internal/metrics"
 	"fmt"
 	"sync"
 	"time"
@@ -97,6 +98,13 @@ var (
 	contextsEvicted uint64
 	janitorOnce     sync.Once
 )
+
+func init() {
+	// Publish the store's size and eviction count so a leak is observable rather
+	// than only inferable from memory growth.
+	metrics.RegisterGauge(metrics.ContextStoreSizeGauge, func() float64 { return float64(RequestContextStoreSize()) })
+	metrics.RegisterGauge(metrics.ContextEvictedGauge, func() float64 { return float64(RequestContextsEvicted()) })
+}
 
 // startContextJanitor launches the background sweep exactly once. It is started
 // lazily from the first Store so that importing the package (as tests and the

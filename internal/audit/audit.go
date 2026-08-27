@@ -31,6 +31,7 @@ package audit
 import (
 	"bytes"
 	"consent-plugin/internal/logging"
+	"consent-plugin/internal/metrics"
 	"context"
 	"encoding/json"
 	"net/http"
@@ -152,6 +153,13 @@ var (
 	emittersMu sync.Mutex
 	emitters   = map[string]*Emitter{}
 )
+
+func init() {
+	// An attacker who can generate load can suppress the record of their own
+	// access by filling the queue, so the loss must be alertable, not merely
+	// logged every hundredth event.
+	metrics.RegisterGauge(metrics.AuditDroppedGauge, func() float64 { return float64(Dropped()) })
+}
 
 // Get returns a shared Emitter for cfg, creating (and starting) one on first use.
 // Emitters are cached by the full configuration (see Config.key), so all routes
