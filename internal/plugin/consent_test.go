@@ -19,6 +19,7 @@ package plugin
 
 import (
 	"consent-plugin/internal/audit"
+	"consent-plugin/internal/consent"
 	"consent-plugin/internal/ownerresolver"
 	"context"
 	"encoding/json"
@@ -213,14 +214,14 @@ func newConsentManager(t *testing.T, userID string, statuses []string) *httptest
 }
 
 // newFailingConsentManager returns a consent-manager whose CONSENT CHECK calls
-// answer with the given status code (used to exercise the fail policy). The
-// participant registry still answers, so the failure under test is the check
-// itself and not the preceding contract lookup.
-func newFailingConsentManager(status int) *httptest.Server {
+// answer 500 (used to exercise the fail policy). The participant registry still
+// answers, so the failure under test is the check itself and not the preceding
+// contract lookup.
+func newFailingConsentManager() *httptest.Server {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/participants", participantRegistryHandler)
 	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(status)
+		w.WriteHeader(http.StatusInternalServerError)
 	})
 	return httptest.NewServer(mux)
 }
@@ -475,7 +476,7 @@ func TestConsentFilter_ResponseFilter(t *testing.T) {
 		{
 			name:              "consent-manager error denies by default (fail-closed)",
 			setupContext:      storeRequest,
-			consentServer:     func(t *testing.T) *httptest.Server { return newFailingConsentManager(http.StatusInternalServerError) },
+			consentServer:     func(t *testing.T) *httptest.Server { return newFailingConsentManager() },
 			resolverServer:    func(t *testing.T) *httptest.Server { return newOwnerResolver(t, ownedBy(testOwnerDID)) },
 			wantWrittenBody:   DefaultDenyResponseBody,
 			wantWrittenStatus: DefaultDenyStatusCode,
@@ -483,7 +484,7 @@ func TestConsentFilter_ResponseFilter(t *testing.T) {
 		{
 			name:           "consent-manager error with fail-open explicitly enabled passes through",
 			setupContext:   storeRequest,
-			consentServer:  func(t *testing.T) *httptest.Server { return newFailingConsentManager(http.StatusInternalServerError) },
+			consentServer:  func(t *testing.T) *httptest.Server { return newFailingConsentManager() },
 			resolverServer: func(t *testing.T) *httptest.Server { return newOwnerResolver(t, ownedBy(testOwnerDID)) },
 			configFn:       func(cfg *Config) { cfg.FailOpen = boolPtr(true) },
 			wantNoWrite:    true,
@@ -491,7 +492,7 @@ func TestConsentFilter_ResponseFilter(t *testing.T) {
 		{
 			name:              "consent-manager error with fail-closed denies",
 			setupContext:      storeRequest,
-			consentServer:     func(t *testing.T) *httptest.Server { return newFailingConsentManager(http.StatusInternalServerError) },
+			consentServer:     func(t *testing.T) *httptest.Server { return newFailingConsentManager() },
 			resolverServer:    func(t *testing.T) *httptest.Server { return newOwnerResolver(t, ownedBy(testOwnerDID)) },
 			configFn:          func(cfg *Config) { cfg.FailOpen = boolPtr(false) },
 			wantWrittenBody:   DefaultDenyResponseBody,
@@ -1293,4 +1294,131 @@ func TestRequestFilter_CorrelationID(t *testing.T) {
 		assert.Equal(t, "/data", stored.Path)
 		assert.Equal(t, "GET", stored.Method)
 	})
+}
+
+// twoPartyBarrier releases both callers only once both have arrived, so a test
+// can force two concurrent consent checks to complete before either cancels the
+// other. It fails the test rather than hanging if the second never arrives.
+func twoPartyBarrier(t *testing.T) func() {
+	t.Helper()
+	arrived := make(chan struct{}, 2)
+	released := make(chan struct{})
+	var once sync.Once
+	return func() {
+		arrived <- struct{}{}
+		if len(arrived) == 2 {
+			once.Do(func() { close(released) })
+		}
+		select {
+		case <-released:
+		case <-time.After(5 * time.Second):
+			t.Errorf("barrier timed out: the second concurrent check never arrived")
+		}
+	}
+}
+
+// TestCheckOwners_DenyOutranksDependencyError is the regression test for the
+// ordering hole the concurrency work opened.
+//
+// Two owners are checked concurrently: the one at index 0 errors (HTTP 500) and
+// the one at index 1 denies. Reducing the results by index alone returned the
+// error, which under fail_open:true releases the response — even though an owner
+// has explicitly refused. A deny is a definite answer and must outrank the
+// absence of one, whatever position it landed in.
+func TestCheckOwners_DenyOutranksDependencyError(t *testing.T) {
+	clearContextStore()
+	consent.ResetCaches()
+
+	const (
+		ownerErroring = "did:key:zErroring"
+		ownerDenying  = "did:key:zDenying"
+	)
+	release := twoPartyBarrier(t)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/participants", participantRegistryHandler)
+	mux.HandleFunc("/v1/users/identifier/search", func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]string
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		if body["email"] == ownerErroring {
+			// Hold until the denying owner's check has also completed, so both
+			// results are genuine rather than one being a cancellation artifact.
+			release()
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{"userIdentifier": "uid-" + body["email"]})
+	})
+	mux.HandleFunc("/v1/consents/participants/", func(w http.ResponseWriter, _ *http.Request) {
+		release()
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"consents": consentsGrantedTo(testConsumerSD, []string{"revoked"}),
+		})
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	// Index 0 errors, index 1 denies.
+	resolver := newOwnerResolver(t, ownedBy(ownerErroring, ownerDenying))
+	defer resolver.Close()
+
+	cfg := newTestConfig(server.URL, resolver.URL+"/resolve")
+	cfg.FailOpen = boolPtr(true)
+
+	const id = uint32(270)
+	storeRequest(id)
+	resp := newMockResponse(id, []byte(`{"id":"x"}`))
+
+	(&ConsentFilter{}).ResponseFilter(cfg, resp)
+
+	assert.Equal(t, DefaultDenyStatusCode, resp.writtenStatus,
+		"an owner's explicit deny must not be masked by another owner's dependency error")
+	assert.Equal(t, DefaultDenyResponseBody, string(resp.writtenBody))
+}
+
+// TestCheckOwners_ErrorStillAppliesFailPolicy verifies the reordering did not
+// swallow the error path: with no deny anywhere, a dependency error is still
+// what decides, and fail_open still governs it.
+func TestCheckOwners_ErrorStillAppliesFailPolicy(t *testing.T) {
+	server := newFailingConsentManager()
+	defer server.Close()
+	resolver := newOwnerResolver(t, ownedBy(testOwnerDID))
+	defer resolver.Close()
+
+	tests := []struct {
+		name       string
+		failOpen   bool
+		wantDenied bool
+	}{
+		{name: "fail-closed denies", failOpen: false, wantDenied: true},
+		{name: "fail-open passes through", failOpen: true, wantDenied: false},
+	}
+
+	// Each case needs its own request id so the context-store entries cannot
+	// collide between subtests.
+	nextRequestID := uint32(280)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			clearContextStore()
+			consent.ResetCaches()
+
+			cfg := newTestConfig(server.URL, resolver.URL+"/resolve")
+			cfg.FailOpen = boolPtr(tt.failOpen)
+
+			nextRequestID++
+			id := nextRequestID
+			storeRequest(id)
+			resp := newMockResponse(id, []byte(`{"id":"x"}`))
+
+			(&ConsentFilter{}).ResponseFilter(cfg, resp)
+
+			if tt.wantDenied {
+				assert.Equal(t, DefaultDenyStatusCode, resp.writtenStatus)
+				return
+			}
+			assert.Equal(t, 0, resp.writtenStatus, "a dependency error with fail_open must still pass through")
+		})
+	}
 }

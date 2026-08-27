@@ -512,23 +512,37 @@ func checkOwners(ctx context.Context, cfg *Config, key string, reqCtx *RequestCo
 		}
 	}
 
+	// Results are reduced by DECISIVENESS first and index second.
+	//
+	// A deny is a definite answer; an error is the absence of one, and only the
+	// absence is subject to the operator's fail policy. Reducing by index alone
+	// ranked the two purely by position, so an error at a lower index could mask
+	// a deny at a higher one — and under `fail_open: true` that released data an
+	// owner had explicitly refused, with the audit record showing the
+	// contradiction (a per-owner deny alongside an enforced allow). Scanning for
+	// a deny across all results first removes the ordering dependency; within
+	// each pass the lowest index still wins, so the verdict stays deterministic
+	// rather than depending on which goroutine finished first.
 	for _, result := range results {
-		if !result.attempted || !result.problem {
-			continue
-		}
-		if result.err != nil {
-			// A call cancelled because a *different* owner already denied is not
-			// itself a failure; the deny it lost the race to is reported instead.
-			if errors.Is(result.err, context.Canceled) && ctx.Err() == nil {
-				continue
-			}
-			logging.ErrorfEvery("consent-check", "ResponseFilter: consent check error for request %s: %s", key, logging.Sanitize(result.err.Error()))
-			req := result.request
-			outcome := failOutcome(cfg, failModeForError(result.err), "consent check error: "+result.err.Error(), key, &req)
+		if result.attempted && result.problem && result.err == nil {
+			outcome := result.outcome
 			outcome.checked = checked
 			return outcome
 		}
-		outcome := result.outcome
+	}
+
+	for _, result := range results {
+		if !result.attempted || result.err == nil {
+			continue
+		}
+		// A call cancelled because a *different* owner already denied is not
+		// itself a failure; that deny was returned by the pass above.
+		if errors.Is(result.err, context.Canceled) && ctx.Err() == nil {
+			continue
+		}
+		logging.ErrorfEvery("consent-check", "ResponseFilter: consent check error for request %s: %s", key, logging.Sanitize(result.err.Error()))
+		req := result.request
+		outcome := failOutcome(cfg, failModeForError(result.err), "consent check error: "+result.err.Error(), key, &req)
 		outcome.checked = checked
 		return outcome
 	}
