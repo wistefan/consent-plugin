@@ -10,3 +10,6 @@ coverage.out
 
 # OS files
 .DS_Store
+
+# Local review/working notes, not part of the repository.
+review.md
