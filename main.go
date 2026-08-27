@@ -29,8 +29,6 @@ import (
 	"errors"
 	"net/http"
 	"os"
-	"os/signal"
-	"syscall"
 	"time"
 
 	"github.com/apache/apisix-go-plugin-runner/pkg/runner"
@@ -50,23 +48,31 @@ const metricsPath = "/metrics"
 const metricsServerTimeout = 10 * time.Second
 
 func main() {
-	// The audit queue is flushed by a background worker on an interval, so a
-	// redeploy or restart would otherwise discard up to one flush interval of
-	// access decisions — silently, from the record whose whole purpose is to be
-	// complete. runner.Run blocks, so the flush is driven from its own goroutine.
-	go flushAuditOnShutdown()
 	go serveMetrics()
 
-	runner.Run(runner.RunnerConfig{})
+	runAndFlush(func() { runner.Run(runner.RunnerConfig{}) }, audit.ShutdownAll)
 }
 
-// flushAuditOnShutdown waits for a termination signal and flushes every audit
-// emitter before the process goes away.
-func flushAuditOnShutdown() {
-	signals := make(chan os.Signal, 1)
-	signal.Notify(signals, syscall.SIGTERM, syscall.SIGINT)
-	<-signals
-	audit.ShutdownAll()
+// runAndFlush runs the plugin runner to completion and only then flushes the
+// audit queue.
+//
+// The ordering is the whole point, and it is easy to get wrong. The runner
+// installs its own signal.Notify for SIGINT/SIGTERM and returns from Run as soon
+// as one arrives. An earlier version of this file waited for the same signal in
+// a goroutine of its own and flushed there — but Go delivers a signal to every
+// registered channel at once, so the runner's handler returned, main returned,
+// and the process exited while the flush was still draining its queue and
+// waiting on an HTTP export. The flush was present and essentially never
+// completed: exactly the loss it was added to prevent, now wearing the
+// appearance of being handled, and invisible to the dropped-events counter
+// because these were not queue-overflow drops.
+//
+// Since Run already blocks until the signal, the flush belongs after it,
+// synchronously, where nothing can exit out from under it — and the plugin needs
+// no signal handler of its own.
+func runAndFlush(run, flush func()) {
+	run()
+	flush()
 }
 
 // serveMetrics exposes the plugin's Prometheus metrics when an address is
