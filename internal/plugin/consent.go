@@ -426,20 +426,11 @@ const maxConcurrentConsentChecks = 8
 //
 // Checks run concurrently up to maxConcurrentConsentChecks and short-circuit on
 // the first problem — the remaining calls are cancelled, since nothing they
-// could return would change the answer. The reported outcome is always the
-// lowest-indexed problem, so the decision (and the audit record) does not depend
-// on which goroutine happened to finish first.
+// could return would change the answer. The results are then reduced by
+// reduceOwnerResults, which ranks them so the verdict does not depend on which
+// goroutine happened to finish first.
 func checkOwners(ctx context.Context, cfg *Config, key string, reqCtx *RequestContext, client *consent.Client, claims []ownerClaim, consumerSD string) responseOutcome {
-	type checkResult struct {
-		outcome   responseOutcome
-		err       error
-		request   consent.ConsentRequest
-		record    checkedOwner
-		problem   bool
-		attempted bool
-	}
-
-	results := make([]checkResult, len(claims))
+	results := make([]ownerCheckResult, len(claims))
 	checksCtx, cancelChecks := context.WithCancel(ctx)
 	defer cancelChecks()
 
@@ -503,6 +494,44 @@ func checkOwners(ctx context.Context, cfg *Config, key string, reqCtx *RequestCo
 	}
 	wg.Wait()
 
+	return reduceOwnerResults(cfg, key, reqCtx, ctx.Err(), results)
+}
+
+// ownerCheckResult is one owner's consent check within a response.
+type ownerCheckResult struct {
+	// outcome is the deny to enforce, set only when the owner denied.
+	outcome responseOutcome
+	// err is the dependency failure, set only when the check could not complete.
+	err error
+	// request is the check that was made, for the audit record on an error.
+	request consent.ConsentRequest
+	// record is this owner's audit entry (allow or deny).
+	record checkedOwner
+	// problem is true for a deny or an error, i.e. anything but a plain allow.
+	problem bool
+	// attempted is false for an owner whose check never started because the
+	// phase was already cancelled.
+	attempted bool
+}
+
+// reduceOwnerResults collapses the per-owner results into the response outcome,
+// enforcing deny_all.
+//
+// Results are ranked by DECISIVENESS first and index second. A deny is a
+// definite answer; an error is the absence of one, and only the absence is
+// subject to the operator's fail policy. Reducing by index alone ranked the two
+// purely by position, so an error at a lower index could mask a deny at a higher
+// one — and under `fail_open: true` that released data an owner had explicitly
+// refused, with the audit record showing the contradiction (a per-owner deny
+// alongside an enforced allow). Scanning for a deny across all results first
+// removes the ordering dependency; within each pass the lowest index still wins,
+// so the verdict stays deterministic rather than depending on which goroutine
+// finished first.
+//
+// phaseErr is the response phase's own context error, which distinguishes a call
+// cancelled because a sibling already denied (not a failure in itself) from one
+// cancelled because the whole phase ran out of budget (which is).
+func reduceOwnerResults(cfg *Config, key string, reqCtx *RequestContext, phaseErr error, results []ownerCheckResult) responseOutcome {
 	// Every owner that was actually consulted is recorded, whatever the verdict,
 	// so the audit log names them all rather than only the first refusal.
 	checked := make([]checkedOwner, 0, len(results))
@@ -512,17 +541,6 @@ func checkOwners(ctx context.Context, cfg *Config, key string, reqCtx *RequestCo
 		}
 	}
 
-	// Results are reduced by DECISIVENESS first and index second.
-	//
-	// A deny is a definite answer; an error is the absence of one, and only the
-	// absence is subject to the operator's fail policy. Reducing by index alone
-	// ranked the two purely by position, so an error at a lower index could mask
-	// a deny at a higher one — and under `fail_open: true` that released data an
-	// owner had explicitly refused, with the audit record showing the
-	// contradiction (a per-owner deny alongside an enforced allow). Scanning for
-	// a deny across all results first removes the ordering dependency; within
-	// each pass the lowest index still wins, so the verdict stays deterministic
-	// rather than depending on which goroutine finished first.
 	for _, result := range results {
 		if result.attempted && result.problem && result.err == nil {
 			outcome := result.outcome
@@ -537,7 +555,7 @@ func checkOwners(ctx context.Context, cfg *Config, key string, reqCtx *RequestCo
 		}
 		// A call cancelled because a *different* owner already denied is not
 		// itself a failure; that deny was returned by the pass above.
-		if errors.Is(result.err, context.Canceled) && ctx.Err() == nil {
+		if errors.Is(result.err, context.Canceled) && phaseErr == nil {
 			continue
 		}
 		logging.ErrorfEvery("consent-check", "ResponseFilter: consent check error for request %s: %s", key, logging.Sanitize(result.err.Error()))

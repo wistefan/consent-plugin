@@ -23,6 +23,7 @@ import (
 	"consent-plugin/internal/ownerresolver"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -1296,86 +1297,127 @@ func TestRequestFilter_CorrelationID(t *testing.T) {
 	})
 }
 
-// twoPartyBarrier releases both callers only once both have arrived, so a test
-// can force two concurrent consent checks to complete before either cancels the
-// other. It fails the test rather than hanging if the second never arrives.
-func twoPartyBarrier(t *testing.T) func() {
-	t.Helper()
-	arrived := make(chan struct{}, 2)
-	released := make(chan struct{})
-	var once sync.Once
-	return func() {
-		arrived <- struct{}{}
-		if len(arrived) == 2 {
-			once.Do(func() { close(released) })
-		}
-		select {
-		case <-released:
-		case <-time.After(5 * time.Second):
-			t.Errorf("barrier timed out: the second concurrent check never arrived")
+// TestReduceOwnerResults is the regression test for the ordering hole the
+// concurrency work opened, exercised at the level where the ranking actually
+// lives.
+//
+// Driving it through two concurrent HTTP checks turned out to be inherently
+// racy: whichever owner finishes first cancels the other, so a sibling's deny
+// can arrive as a cancellation instead — the test passed or failed on timing
+// rather than on the property. Reducing scripted results is deterministic and
+// pins the rule directly.
+func TestReduceOwnerResults(t *testing.T) {
+	reqCtx := &RequestContext{Method: "GET", Path: "/data"}
+
+	denied := func(owner string) ownerCheckResult {
+		return ownerCheckResult{
+			attempted: true,
+			problem:   true,
+			outcome: responseOutcome{
+				decision: decisionDeny, reason: "no granted consent", requestID: "req-1",
+				subject: owner, resource: "/data", method: "GET",
+			},
+			record: checkedOwner{subject: owner, resource: "/data", decision: decisionDeny},
 		}
 	}
-}
-
-// TestCheckOwners_DenyOutranksDependencyError is the regression test for the
-// ordering hole the concurrency work opened.
-//
-// Two owners are checked concurrently: the one at index 0 errors (HTTP 500) and
-// the one at index 1 denies. Reducing the results by index alone returned the
-// error, which under fail_open:true releases the response — even though an owner
-// has explicitly refused. A deny is a definite answer and must outrank the
-// absence of one, whatever position it landed in.
-func TestCheckOwners_DenyOutranksDependencyError(t *testing.T) {
-	clearContextStore()
-	consent.ResetCaches()
-
-	const (
-		ownerErroring = "did:key:zErroring"
-		ownerDenying  = "did:key:zDenying"
-	)
-	release := twoPartyBarrier(t)
-
-	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/participants", participantRegistryHandler)
-	mux.HandleFunc("/v1/users/identifier/search", func(w http.ResponseWriter, r *http.Request) {
-		var body map[string]string
-		_ = json.NewDecoder(r.Body).Decode(&body)
-		if body["email"] == ownerErroring {
-			// Hold until the denying owner's check has also completed, so both
-			// results are genuine rather than one being a cancellation artifact.
-			release()
-			w.WriteHeader(http.StatusInternalServerError)
-			return
+	allowed := func(owner string) ownerCheckResult {
+		return ownerCheckResult{
+			attempted: true,
+			record:    checkedOwner{subject: owner, resource: "/data", decision: decisionAllow},
 		}
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]string{"userIdentifier": "uid-" + body["email"]})
-	})
-	mux.HandleFunc("/v1/consents/participants/", func(w http.ResponseWriter, _ *http.Request) {
-		release()
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{
-			"consents": consentsGrantedTo(testConsumerSD, []string{"revoked"}),
+	}
+	errored := func(owner string, err error) ownerCheckResult {
+		return ownerCheckResult{
+			attempted: true,
+			problem:   true,
+			err:       err,
+			request:   consent.ConsentRequest{Subject: owner, Resource: "/data", Method: "GET"},
+		}
+	}
+
+	dependencyErr := errors.New("consent client: consents lookup returned status 500")
+
+	tests := []struct {
+		name         string
+		failOpen     bool
+		phaseErr     error
+		results      []ownerCheckResult
+		wantDecision string
+		wantSubject  string
+		wantChecked  int
+	}{
+		{
+			name: "every owner allows", failOpen: false,
+			results:      []ownerCheckResult{allowed("a"), allowed("b")},
+			wantDecision: decisionAllow, wantChecked: 2,
+		},
+		{
+			name: "one deny denies them all", failOpen: false,
+			results:      []ownerCheckResult{allowed("a"), denied("b")},
+			wantDecision: decisionDeny, wantSubject: "b", wantChecked: 2,
+		},
+		{
+			// The finding: with fail_open the error path allows, so ranking the
+			// error first releases data owner b has explicitly refused.
+			name: "a deny at a higher index outranks an error at a lower one", failOpen: true,
+			results:      []ownerCheckResult{errored("a", dependencyErr), denied("b")},
+			wantDecision: decisionDeny, wantSubject: "b", wantChecked: 1,
+		},
+		{
+			name: "a deny at a lower index still wins", failOpen: true,
+			results:      []ownerCheckResult{denied("a"), errored("b", dependencyErr)},
+			wantDecision: decisionDeny, wantSubject: "a", wantChecked: 1,
+		},
+		{
+			name: "the lowest-indexed deny is reported", failOpen: false,
+			results:      []ownerCheckResult{denied("a"), denied("b")},
+			wantDecision: decisionDeny, wantSubject: "a", wantChecked: 2,
+		},
+		{
+			name: "with no deny anywhere, fail-open allows on an error", failOpen: true,
+			results:      []ownerCheckResult{allowed("a"), errored("b", dependencyErr)},
+			wantDecision: decisionAllow, wantChecked: 1,
+		},
+		{
+			name: "with no deny anywhere, fail-closed denies on an error", failOpen: false,
+			results:      []ownerCheckResult{allowed("a"), errored("b", dependencyErr)},
+			wantDecision: decisionDeny, wantChecked: 1,
+		},
+		{
+			// A sibling deny cancels the rest; those cancellations are not
+			// failures, and the deny that caused them is what gets reported.
+			name: "a cancellation caused by a sibling deny is ignored", failOpen: true,
+			results:      []ownerCheckResult{errored("a", context.Canceled), denied("b")},
+			wantDecision: decisionDeny, wantSubject: "b", wantChecked: 1,
+		},
+		{
+			// But a cancellation from the phase deadline IS a failure.
+			name: "a cancellation from the phase deadline applies the fail policy", failOpen: false,
+			phaseErr:     context.DeadlineExceeded,
+			results:      []ownerCheckResult{errored("a", context.Canceled), allowed("b")},
+			wantDecision: decisionDeny, wantChecked: 1,
+		},
+		{
+			name: "owners whose check never started are ignored", failOpen: false,
+			results:      []ownerCheckResult{allowed("a"), {}},
+			wantDecision: decisionAllow, wantChecked: 1,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &Config{FailOpen: boolPtr(tt.failOpen)}
+
+			got := reduceOwnerResults(cfg, "req-1", reqCtx, tt.phaseErr, tt.results)
+
+			assert.Equal(t, tt.wantDecision, got.decision)
+			if tt.wantSubject != "" {
+				assert.Equal(t, tt.wantSubject, got.subject, "the reported owner must be the deciding one")
+			}
+			assert.Len(t, got.checked, tt.wantChecked,
+				"every consulted owner must reach the audit log, and only those")
 		})
-	})
-	server := httptest.NewServer(mux)
-	defer server.Close()
-
-	// Index 0 errors, index 1 denies.
-	resolver := newOwnerResolver(t, ownedBy(ownerErroring, ownerDenying))
-	defer resolver.Close()
-
-	cfg := newTestConfig(server.URL, resolver.URL+"/resolve")
-	cfg.FailOpen = boolPtr(true)
-
-	const id = uint32(270)
-	storeRequest(id)
-	resp := newMockResponse(id, []byte(`{"id":"x"}`))
-
-	(&ConsentFilter{}).ResponseFilter(cfg, resp)
-
-	assert.Equal(t, DefaultDenyStatusCode, resp.writtenStatus,
-		"an owner's explicit deny must not be masked by another owner's dependency error")
-	assert.Equal(t, DefaultDenyResponseBody, string(resp.writtenBody))
+	}
 }
 
 // TestCheckOwners_ErrorStillAppliesFailPolicy verifies the reordering did not
