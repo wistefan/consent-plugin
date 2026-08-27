@@ -33,7 +33,7 @@ GET {base}/consents/participants/{userIdentifier}?receipt=true
 Header: Authorization: Bearer <participant_token>
 →      { "consents": [ { "status": "granted" | "revoked" | ... } ] }
 ```
-Access is **allowed** iff at least one returned consent has `status == "granted"`.
+Access is **allowed** if at least one returned consent has `status == "granted"`.
 
 The subject DID is taken from the JWT `sub` claim (so `jwt_claims_to_forward` must include `sub`) and sent as the user `email` (the consent-manager's DID-in-email convention).
 

@@ -48,6 +48,11 @@ type ConsentRequest struct {
 	// Method is the HTTP method of the original request (e.g., "GET", "POST").
 	Method string `json:"method"`
 
+	// DataResource, when set, scopes the check: a granted consent counts only if
+	// it covers this resource (matched against the consent's data[].resource).
+	// Empty means owner-level (any granted consent counts).
+	DataResource string `json:"data_resource,omitempty"`
+
 	// Claims contains the forwarded JWT claims as key-value pairs.
 	Claims map[string]interface{} `json:"claims,omitempty"`
 

@@ -15,6 +15,21 @@ const (
 	// DefaultConsentAPITimeout is the default timeout in milliseconds for consent API calls.
 	DefaultConsentAPITimeout = 5000
 
+	// DefaultOwnerResolverTimeout is the default timeout in milliseconds for
+	// OwnerResolver calls.
+	DefaultOwnerResolverTimeout = 2000
+
+	// DefaultConsumerClaim is the dotted claim path holding the consuming
+	// participant's identity. The provider's verifier embeds the presented
+	// credential in the access token (jwtInclusion.fullInclusion), so the
+	// credential's issuer is the consumer.
+	DefaultConsumerClaim = "verifiableCredential.issuer"
+
+	// DefaultTokenAudience is the audience asked of the token service when none is
+	// configured. It names the token service's configured target for the
+	// consent-manager, not a URL.
+	DefaultTokenAudience = "consent-manager"
+
 	// DefaultJWTHeaderName is the default HTTP header containing the JWT token.
 	DefaultJWTHeaderName = "Authorization"
 
@@ -53,11 +68,9 @@ const (
 	// EnvConsentKey supplies ConsentKey (x-visionstrust-consent-key).
 	EnvConsentKey = "CONSENT_KEY"
 
-	// EnvClientID supplies ClientID (participant client-credentials login).
-	EnvClientID = "CONSENT_CLIENT_ID"
-
-	// EnvClientSecret supplies ClientSecret (participant client-credentials login).
-	EnvClientSecret = "CONSENT_CLIENT_SECRET"
+	// EnvTokenServiceURL supplies TokenServiceURL (the participant-local OID4VP
+	// token service).
+	EnvTokenServiceURL = "CONSENT_TOKEN_SERVICE_URL"
 
 	// EnvAuditOTLPEndpoint supplies AuditOTLPEndpoint (the OTLP/HTTP Collector
 	// endpoint access-decision audit events are exported to).
@@ -88,29 +101,60 @@ type Config struct {
 	// paths. Defaults to DefaultConsentAPIPrefix ("/v1").
 	ConsentAPIPrefix string `json:"consent_api_prefix,omitempty"`
 
+	// OwnerResolverURL is the external OwnerResolver /resolve endpoint. When set,
+	// the data owner is resolved from the RESPONSE DATA (never the requestor):
+	// the plugin posts the payload, gets back (owner[, dataResource]) claims, and
+	// checks consent per owner. When empty, the plugin falls back to the legacy
+	// behaviour of taking the subject from the JWT.
+	OwnerResolverURL string `json:"owner_resolver_url,omitempty"`
+
+	// ConsentAPIHost overrides the HTTP Host header sent on consent-manager
+	// calls. Needed when ConsentAPIURL points at an in-cluster gateway service
+	// whose routes are host-scoped to the public ingress name: the TCP connection
+	// still uses the URL's host, but the Host header must equal the route's host
+	// or APISIX returns "404 Route Not Found".
+	ConsentAPIHost string `json:"consent_api_host,omitempty"`
+
+	// OwnerResolverTimeout is the per-call timeout in milliseconds for the
+	// OwnerResolver (defaults to DefaultOwnerResolverTimeout).
+	OwnerResolverTimeout int `json:"owner_resolver_timeout,omitempty"`
+
+	// Service is the logical dataset id sent to the OwnerResolver as
+	// resource.service, so it can select the right rule for this route.
+	Service string `json:"service,omitempty"`
+
+	// ConsumerClaim is the dotted path of the token claim identifying the
+	// consuming participant, forwarded to the OwnerResolver as parties.consumer so
+	// it can find the governing contract. Defaults to DefaultConsumerClaim. It is
+	// used for contract lookup ONLY - never to determine the data owner.
+	ConsumerClaim string `json:"consumer_claim,omitempty"`
+
 	// ConsentKey is the shared secret sent as the x-visionstrust-consent-key
 	// header on the identifier-search call. Optional: when the plugin runs
 	// behind the authority's facade, the facade injects the key server-side and
 	// this is not needed. Falls back to the EnvConsentKey env var when empty.
 	ConsentKey string `json:"consent_key,omitempty"`
 
-	// ClientID / ClientSecret are the participant client credentials. When set,
-	// the plugin obtains (and refreshes) a participant token via
-	// /participants/login, and — when ProviderSD is empty — derives the provider
-	// self-description from /participants/me. Preferred over a static
-	// ParticipantToken, as these are stable while the token expires. Each falls
-	// back to its env var (EnvClientID / EnvClientSecret) when empty, so the
-	// secret need not sit in the route config.
-	ClientID     string `json:"client_id,omitempty"`
-	ClientSecret string `json:"client_secret,omitempty"`
+	// TokenServiceURL is the participant-local OID4VP token service the plugin
+	// asks for an access token — the consent-facade's POST /internal/tokens. The
+	// plugin holds no participant credentials of its own: the facade presents the
+	// participant's verifiable credential and returns a short-lived token, which
+	// the plugin caches and refreshes. Falls back to EnvTokenServiceURL when
+	// empty. Required unless a static ParticipantToken is configured.
+	TokenServiceURL string `json:"token_service_url,omitempty"`
 
-	// ParticipantTokenTTL caps, in seconds, how long a client-credentials token
-	// is cached before re-login (defaults to 3000s). Ignored for a static token.
+	// TokenAudience is the audience name asked of the token service (its
+	// configured target, not a URL). Defaults to DefaultTokenAudience.
+	TokenAudience string `json:"token_audience,omitempty"`
+
+	// ParticipantTokenTTL caps, in seconds, how long a fetched token is cached
+	// (defaults to 3000s). The token service reports its own lifetime; the
+	// shorter of the two wins. Ignored for a static token.
 	ParticipantTokenTTL int `json:"participant_token_ttl,omitempty"`
 
-	// ParticipantToken is an optional *static* participant JWT for the
-	// consents-lookup call. Legacy/override: prefer ClientID/ClientSecret so the
-	// token is fetched and refreshed automatically.
+	// ParticipantToken is an optional *static*, pre-obtained access token for the
+	// consents-lookup call. An override for tests and manual runs; normally the
+	// token comes from TokenServiceURL so it is refreshed automatically.
 	ParticipantToken string `json:"participant_token,omitempty"`
 
 	// ProviderSD is the provider self-description URL sent on the
@@ -174,6 +218,15 @@ func (c *Config) applyDefaults() {
 	if c.ConsentAPIPrefix == "" {
 		c.ConsentAPIPrefix = DefaultConsentAPIPrefix
 	}
+	if c.OwnerResolverURL != "" && c.OwnerResolverTimeout == 0 {
+		c.OwnerResolverTimeout = DefaultOwnerResolverTimeout
+	}
+	if c.OwnerResolverURL != "" && c.ConsumerClaim == "" {
+		c.ConsumerClaim = DefaultConsumerClaim
+	}
+	if c.TokenAudience == "" {
+		c.TokenAudience = DefaultTokenAudience
+	}
 	if c.DenyStatusCode == 0 {
 		c.DenyStatusCode = DefaultDenyStatusCode
 	}
@@ -194,11 +247,8 @@ func (c *Config) applyEnv() {
 	if c.ConsentKey == "" {
 		c.ConsentKey = os.Getenv(EnvConsentKey)
 	}
-	if c.ClientID == "" {
-		c.ClientID = os.Getenv(EnvClientID)
-	}
-	if c.ClientSecret == "" {
-		c.ClientSecret = os.Getenv(EnvClientSecret)
+	if c.TokenServiceURL == "" {
+		c.TokenServiceURL = os.Getenv(EnvTokenServiceURL)
 	}
 	if c.AuditOTLPEndpoint == "" {
 		c.AuditOTLPEndpoint = os.Getenv(EnvAuditOTLPEndpoint)
@@ -232,6 +282,26 @@ func (c *Config) Validate() error {
 
 	if c.AuditEnabled && c.AuditOTLPEndpoint == "" {
 		return errors.New("config validation: audit_otlp_endpoint is required when audit_enabled is true")
+	}
+
+	if c.OwnerResolverURL != "" {
+		resolverURL, err := url.ParseRequestURI(c.OwnerResolverURL)
+		if err != nil {
+			return fmt.Errorf("config validation: owner_resolver_url is not a valid URL: %w", err)
+		}
+		if resolverURL.Scheme != "http" && resolverURL.Scheme != "https" {
+			return fmt.Errorf("config validation: owner_resolver_url must use http or https scheme, got %q", resolverURL.Scheme)
+		}
+	}
+
+	if c.TokenServiceURL != "" {
+		tokenServiceURL, err := url.ParseRequestURI(c.TokenServiceURL)
+		if err != nil {
+			return fmt.Errorf("config validation: token_service_url is not a valid URL: %w", err)
+		}
+		if tokenServiceURL.Scheme != "http" && tokenServiceURL.Scheme != "https" {
+			return fmt.Errorf("config validation: token_service_url must use http or https scheme, got %q", tokenServiceURL.Scheme)
+		}
 	}
 
 	return nil
