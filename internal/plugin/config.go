@@ -23,6 +23,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/url"
 	"os"
 )
@@ -205,10 +206,12 @@ type Config struct {
 	// Defaults to DefaultDenyResponseContentType ("application/json").
 	DenyResponseContentType string `json:"deny_response_content_type,omitempty"`
 
-	// FailOpen controls the behavior when the consent API is unavailable or
-	// returns an error. When nil or true (default), responses pass through
-	// on consent API errors (fail-open). When false, responses are denied
-	// on consent API errors (fail-closed).
+	// FailOpen controls what happens when a dependency is unavailable or errors.
+	// It defaults to FALSE (fail-closed): the failure mode of a consent gate must
+	// not be "release the personal data", and it must certainly not be reached by
+	// omitting a field. Setting it to true is a deliberate, logged decision to
+	// prefer availability over the gate, and even then it does not apply to
+	// conditions that are misconfigurations rather than outages (see failMode).
 	FailOpen *bool `json:"fail_open,omitempty"`
 
 	// AuditEnabled turns on emitting an access-decision audit event to an
@@ -228,11 +231,11 @@ type Config struct {
 	AuditServiceName string `json:"audit_service_name,omitempty"`
 }
 
-// IsFailOpen returns whether the plugin should fail-open when the consent API
-// is unavailable. Returns true (fail-open) by default when FailOpen is nil.
+// IsFailOpen returns whether the plugin should fail-open when a dependency is
+// unavailable. Returns false (fail-closed) by default when FailOpen is nil.
 func (c *Config) IsFailOpen() bool {
 	if c.FailOpen == nil {
-		return true
+		return false
 	}
 	return *c.FailOpen
 }
@@ -359,6 +362,11 @@ func ParseConfig(in []byte) (*Config, error) {
 
 	if err := conf.Validate(); err != nil {
 		return nil, err
+	}
+
+	if conf.IsFailOpen() {
+		log.Printf("[consent-filter] WARNING: fail_open is enabled for %s — a consent-manager or resolver outage will RELEASE personal data instead of denying it",
+			conf.ConsentAPIURL)
 	}
 
 	return &conf, nil

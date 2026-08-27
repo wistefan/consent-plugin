@@ -414,10 +414,19 @@ func TestConsentFilter_ResponseFilter(t *testing.T) {
 			wantWrittenStatus: DefaultDenyStatusCode,
 		},
 		{
-			name:           "resolver error with fail-open passes through",
+			name:              "resolver error denies by default (fail-closed)",
+			setupContext:      storeRequest,
+			consentServer:     newUncalledConsentManager,
+			resolverServer:    func(t *testing.T) *httptest.Server { return newFailingOwnerResolver(http.StatusInternalServerError) },
+			wantWrittenBody:   DefaultDenyResponseBody,
+			wantWrittenStatus: DefaultDenyStatusCode,
+		},
+		{
+			name:           "resolver error with fail-open explicitly enabled passes through",
 			setupContext:   storeRequest,
 			consentServer:  newUncalledConsentManager,
 			resolverServer: func(t *testing.T) *httptest.Server { return newFailingOwnerResolver(http.StatusInternalServerError) },
+			configFn:       func(cfg *Config) { cfg.FailOpen = boolPtr(true) },
 			wantNoWrite:    true,
 		},
 		{
@@ -430,10 +439,19 @@ func TestConsentFilter_ResponseFilter(t *testing.T) {
 			wantWrittenStatus: DefaultDenyStatusCode,
 		},
 		{
-			name:           "consent-manager error with fail-open passes through",
+			name:              "consent-manager error denies by default (fail-closed)",
+			setupContext:      storeRequest,
+			consentServer:     func(t *testing.T) *httptest.Server { return newFailingConsentManager(http.StatusInternalServerError) },
+			resolverServer:    func(t *testing.T) *httptest.Server { return newOwnerResolver(t, ownedBy(testOwnerDID)) },
+			wantWrittenBody:   DefaultDenyResponseBody,
+			wantWrittenStatus: DefaultDenyStatusCode,
+		},
+		{
+			name:           "consent-manager error with fail-open explicitly enabled passes through",
 			setupContext:   storeRequest,
 			consentServer:  func(t *testing.T) *httptest.Server { return newFailingConsentManager(http.StatusInternalServerError) },
 			resolverServer: func(t *testing.T) *httptest.Server { return newOwnerResolver(t, ownedBy(testOwnerDID)) },
+			configFn:       func(cfg *Config) { cfg.FailOpen = boolPtr(true) },
 			wantNoWrite:    true,
 		},
 		{
@@ -446,11 +464,15 @@ func TestConsentFilter_ResponseFilter(t *testing.T) {
 			wantWrittenStatus: DefaultDenyStatusCode,
 		},
 		{
-			name:           "missing request context with fail-open passes through",
-			setupContext:   nil,
-			consentServer:  newUncalledConsentManager,
-			resolverServer: newUncalledOwnerResolver,
-			wantNoWrite:    true,
+			// Losing the request context is not an outage to ride out: the plugin
+			// cannot gate at all, so fail_open must not turn it into a bypass.
+			name:              "missing request context denies even with fail-open enabled",
+			setupContext:      nil,
+			consentServer:     newUncalledConsentManager,
+			resolverServer:    newUncalledOwnerResolver,
+			configFn:          func(cfg *Config) { cfg.FailOpen = boolPtr(true) },
+			wantWrittenBody:   DefaultDenyResponseBody,
+			wantWrittenStatus: DefaultDenyStatusCode,
 		},
 		{
 			name:              "missing request context with fail-closed denies",
@@ -488,6 +510,21 @@ func TestConsentFilter_ResponseFilter(t *testing.T) {
 			consentServer:     newUncalledConsentManager,
 			resolverServer:    newUncalledOwnerResolver,
 			configFn:          func(cfg *Config) { cfg.FailOpen = boolPtr(false) },
+			wantWrittenBody:   DefaultDenyResponseBody,
+			wantWrittenStatus: DefaultDenyStatusCode,
+		},
+		{
+			// A route with no way to authenticate as the participant is a
+			// misconfiguration; fail_open must not make it a silent full bypass.
+			name:           "missing participant credentials deny even with fail-open enabled",
+			setupContext:   storeRequest,
+			consentServer:  newUncalledConsentManager,
+			resolverServer: newUncalledOwnerResolver,
+			configFn: func(cfg *Config) {
+				cfg.FailOpen = boolPtr(true)
+				cfg.ParticipantToken = ""
+				cfg.TokenServiceURL = ""
+			},
 			wantWrittenBody:   DefaultDenyResponseBody,
 			wantWrittenStatus: DefaultDenyStatusCode,
 		},
@@ -673,7 +710,7 @@ func TestConfig_IsFailOpen(t *testing.T) {
 		failOpen *bool
 		want     bool
 	}{
-		{name: "nil defaults to true (fail-open)", failOpen: nil, want: true},
+		{name: "nil defaults to false (fail-closed)", failOpen: nil, want: false},
 		{name: "explicitly true is fail-open", failOpen: boolPtr(true), want: true},
 		{name: "explicitly false is fail-closed", failOpen: boolPtr(false), want: false},
 	}

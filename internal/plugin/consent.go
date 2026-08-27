@@ -25,6 +25,7 @@ import (
 	"consent-plugin/internal/jwt"
 	"consent-plugin/internal/ownerresolver"
 	"context"
+	"errors"
 	"log"
 	"net/http"
 	"strings"
@@ -207,7 +208,7 @@ func (c *ConsentFilter) evaluate(cfg *Config, w pkgHTTP.Response) responseOutcom
 	key, ok := correlationKey(w)
 	if !ok {
 		log.Printf("[consent-filter] ResponseFilter: could not read %q for request %d; cannot verify consent", nginxRequestIDVar, w.ID())
-		return failOutcome(cfg, "no request correlation id", "", nil)
+		return failOutcome(cfg, failAlwaysClosed, "no request correlation id", "", nil)
 	}
 
 	// Load and delete stored request context (cleanup to prevent memory leaks).
@@ -217,7 +218,7 @@ func (c *ConsentFilter) evaluate(cfg *Config, w pkgHTTP.Response) responseOutcom
 		// consent decision cannot be made, so honor the fail policy instead
 		// of silently passing the response through.
 		log.Printf("[consent-filter] ResponseFilter: no request context found for request %s; cannot verify consent", key)
-		return failOutcome(cfg, "no request context", key, nil)
+		return failOutcome(cfg, failAlwaysClosed, "no request context", key, nil)
 	}
 
 	// Resolve the data owner(s) from the response DATA and check consent per
@@ -234,7 +235,7 @@ func (c *ConsentFilter) evaluateWithResolver(cfg *Config, w pkgHTTP.Response, ke
 	body, err := w.ReadBody()
 	if err != nil {
 		log.Printf("[consent-filter] ResponseFilter: could not read upstream body for request %s: %v", key, err)
-		return failOutcome(cfg, "read upstream body: "+err.Error(), key, nil)
+		return failOutcome(cfg, failByPolicy, "read upstream body: "+err.Error(), key, nil)
 	}
 
 	contentType := ""
@@ -256,12 +257,12 @@ func (c *ConsentFilter) evaluateWithResolver(cfg *Config, w pkgHTTP.Response, ke
 	consumerDID := consumerFromClaims(reqCtx.JWTClaims, cfg.ConsumerClaim)
 	if consumerDID == "" {
 		log.Printf("[consent-filter] ResponseFilter: no consuming participant in the token claims (path %q) for request %s", cfg.ConsumerClaim, key)
-		return failOutcome(cfg, "no consuming participant identified", key, nil)
+		return failOutcome(cfg, failAlwaysClosed, "no consuming participant identified", key, nil)
 	}
 	consumerSD, sdErr := consentClient.ParticipantSelfDescriptionByDID(context.Background(), consumerDID)
 	if sdErr != nil {
 		log.Printf("[consent-filter] ResponseFilter: could not map the consumer to a participant for request %s: %v", key, sdErr)
-		return failOutcome(cfg, "consumer participant lookup failed: "+sdErr.Error(), key, nil)
+		return failOutcome(cfg, failModeForError(sdErr), "consumer participant lookup failed: "+sdErr.Error(), key, nil)
 	}
 	// The consumer also scopes the consent match itself: a consent names the one
 	// participant it was granted to, so releasing data to any other participant
@@ -271,7 +272,7 @@ func (c *ConsentFilter) evaluateWithResolver(cfg *Config, w pkgHTTP.Response, ke
 	providerSD, sdErr := consentClient.ProviderSelfDescription(context.Background())
 	if sdErr != nil {
 		log.Printf("[consent-filter] ResponseFilter: could not determine the provider self-description for request %s: %v", key, sdErr)
-		return failOutcome(cfg, "provider self-description lookup failed: "+sdErr.Error(), key, nil)
+		return failOutcome(cfg, failModeForError(sdErr), "provider self-description lookup failed: "+sdErr.Error(), key, nil)
 	}
 	resolveParties.Provider = providerSD
 
@@ -284,7 +285,7 @@ func (c *ConsentFilter) evaluateWithResolver(cfg *Config, w pkgHTTP.Response, ke
 	}, resolveParties, body)
 	if err != nil {
 		log.Printf("[consent-filter] ResponseFilter: owner resolver error for request %s: %v", key, err)
-		return failOutcome(cfg, "owner resolver error: "+err.Error(), key, nil)
+		return failOutcome(cfg, failByPolicy, "owner resolver error: "+err.Error(), key, nil)
 	}
 
 	if !result.ConsentRequired {
@@ -292,7 +293,7 @@ func (c *ConsentFilter) evaluateWithResolver(cfg *Config, w pkgHTTP.Response, ke
 	}
 	if len(result.Claims) == 0 {
 		// Consent required but no owner could be resolved — fail closed.
-		return failOutcome(cfg, "consent required but no data owner resolved", key, nil)
+		return failOutcome(cfg, failAlwaysClosed, "consent required but no data owner resolved", key, nil)
 	}
 
 	// deny_all: every distinct (owner, dataResource) claim must be granted.
@@ -300,7 +301,7 @@ func (c *ConsentFilter) evaluateWithResolver(cfg *Config, w pkgHTTP.Response, ke
 	checked := make(map[pair]bool)
 	for _, claim := range result.Claims {
 		if claim.OwnerID == "" {
-			return failOutcome(cfg, "resolved claim without a data owner", key, nil)
+			return failOutcome(cfg, failAlwaysClosed, "resolved claim without a data owner", key, nil)
 		}
 		p := pair{owner: claim.OwnerID, resource: claim.DataResource}
 		if checked[p] {
@@ -319,7 +320,7 @@ func (c *ConsentFilter) evaluateWithResolver(cfg *Config, w pkgHTTP.Response, ke
 		resp, err := consentClient.CheckConsent(context.Background(), req)
 		if err != nil {
 			log.Printf("[consent-filter] ResponseFilter: consent check error for request %s: %v", key, err)
-			return failOutcome(cfg, "consent check error: "+err.Error(), key, &req)
+			return failOutcome(cfg, failModeForError(err), "consent check error: "+err.Error(), key, &req)
 		}
 		if resp.Decision != consent.DecisionAllow {
 			return responseOutcome{
@@ -359,12 +360,31 @@ func resourceOrPath(dataResource, path string) string {
 	return path
 }
 
-// failOutcome builds the outcome for an unresolved consent check, applying the
-// fail policy (allow when fail-open, otherwise deny). req may be nil when no
+// failMode classifies why a consent decision could not be reached, because not
+// every unresolved situation deserves the same policy.
+type failMode int
+
+const (
+	// failByPolicy is an availability failure of a dependency — the resolver or
+	// the consent-manager is down, slow, or erroring. Whether that releases the
+	// data is the operator's call, so cfg.FailOpen decides.
+	failByPolicy failMode = iota
+
+	// failAlwaysClosed is a situation in which the plugin is structurally unable
+	// to gate: it cannot correlate the two phases, it never captured the request,
+	// it has no credentials at all, or the resolver says consent is required but
+	// names no owner. None of these are outages to ride out — fail_open must not
+	// turn a misconfiguration or a lost request into a silent bypass, so these
+	// always deny.
+	failAlwaysClosed
+)
+
+// failOutcome builds the outcome for an unresolved consent check. mode decides
+// whether the operator's fail policy applies at all. req may be nil when no
 // request context was captured.
-func failOutcome(cfg *Config, reason, requestID string, req *consent.ConsentRequest) responseOutcome {
+func failOutcome(cfg *Config, mode failMode, reason, requestID string, req *consent.ConsentRequest) responseOutcome {
 	decision := decisionDeny
-	if cfg.IsFailOpen() {
+	if mode == failByPolicy && cfg.IsFailOpen() {
 		decision = decisionAllow
 	}
 	o := responseOutcome{decision: decision, reason: reason, requestID: requestID}
@@ -374,6 +394,16 @@ func failOutcome(cfg *Config, reason, requestID string, req *consent.ConsentRequ
 		o.method = req.Method
 	}
 	return o
+}
+
+// failModeForError maps a dependency error to its fail mode: a missing
+// credential is a misconfiguration that must never be failed open on, anything
+// else is treated as an outage the operator's policy governs.
+func failModeForError(err error) failMode {
+	if errors.Is(err, consent.ErrNoCredentials) {
+		return failAlwaysClosed
+	}
+	return failByPolicy
 }
 
 // recordAudit emits the decision to the audit sink when auditing is enabled.

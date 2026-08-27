@@ -84,6 +84,12 @@ const (
 // (HTTP 401), so a cached token should be refreshed and the call retried.
 var errParticipantUnauthorized = errors.New("consent client: participant token unauthorized")
 
+// ErrNoCredentials signals that the client has no way to authenticate as the
+// participant at all. It is a misconfiguration, not an availability failure:
+// callers must never treat it as a transient error to be failed open on, or a
+// mistyped route config becomes a silent, total bypass of the gate.
+var ErrNoCredentials = errors.New("consent client: no participant_token and no token_service_url configured")
+
 // ClientConfig holds everything needed to verify consent against the
 // (Prometheus-X / Visions) consent-manager.
 type ClientConfig struct {
@@ -315,7 +321,7 @@ func (c *Client) credentials(ctx context.Context, forceFetch bool) (token, provi
 		return c.staticToken, c.providerSD, nil
 	}
 	if c.staticToken == "" && c.tokenServiceURL == "" {
-		return "", "", fmt.Errorf("consent client: no participant_token and no token_service_url configured")
+		return "", "", ErrNoCredentials
 	}
 
 	// Get-or-create the per-key entry under the map lock (brief), then release it
