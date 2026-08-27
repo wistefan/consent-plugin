@@ -53,6 +53,15 @@ const (
 	MinMaxOwnersPerResponse = 1
 	MaxMaxOwnersPerResponse = 1000
 
+	// DefaultMaxResolveBodyBytes is the default cap on the upstream body
+	// forwarded to the OwnerResolver (1 MiB).
+	DefaultMaxResolveBodyBytes = 1 << 20
+
+	// MinMaxResolveBodyBytes and MaxMaxResolveBodyBytes bound that cap (up to
+	// 100 MiB, which is already well past what a gated route should return).
+	MinMaxResolveBodyBytes = 1
+	MaxMaxResolveBodyBytes = 100 << 20
+
 	// MinResponsePhaseTimeout and MaxResponsePhaseTimeout bound the response-phase
 	// budget in milliseconds (120s is already far beyond any sane gateway timeout).
 	MinResponsePhaseTimeout = 1
@@ -201,6 +210,16 @@ type Config struct {
 	// Defaults to DefaultResponsePhaseTimeout.
 	ResponsePhaseTimeout int `json:"response_phase_timeout,omitempty"`
 
+	// MaxResolveBodyBytes caps the upstream body forwarded to the OwnerResolver.
+	//
+	// The body is read whole, validated as JSON, and marshalled again into the
+	// resolve envelope, so the peak footprint is roughly 3x its size per in-flight
+	// request — on top of APISIX's own buffering of the same response. A handful
+	// of concurrent large-collection responses can therefore drive the runner's
+	// memory well past what the response size suggests. A body above this is
+	// denied rather than forwarded. Defaults to DefaultMaxResolveBodyBytes.
+	MaxResolveBodyBytes int `json:"max_resolve_body_bytes,omitempty"`
+
 	// MaxOwnersPerResponse caps how many distinct data owners are checked for a
 	// single response. A response resolving to more owners than this is denied
 	// rather than answered after an unbounded number of consent calls.
@@ -328,6 +347,9 @@ func (c *Config) applyDefaults() {
 	if c.MaxOwnersPerResponse == 0 {
 		c.MaxOwnersPerResponse = DefaultMaxOwnersPerResponse
 	}
+	if c.MaxResolveBodyBytes == 0 {
+		c.MaxResolveBodyBytes = DefaultMaxResolveBodyBytes
+	}
 	if c.ParticipantTokenTTL == 0 {
 		c.ParticipantTokenTTL = DefaultParticipantTokenTTL
 	}
@@ -420,6 +442,11 @@ func (c *Config) Validate() error {
 	if c.ResponsePhaseTimeout < MinResponsePhaseTimeout || c.ResponsePhaseTimeout > MaxResponsePhaseTimeout {
 		return fmt.Errorf("config validation: response_phase_timeout must be between %d and %d, got %d",
 			MinResponsePhaseTimeout, MaxResponsePhaseTimeout, c.ResponsePhaseTimeout)
+	}
+
+	if c.MaxResolveBodyBytes < MinMaxResolveBodyBytes || c.MaxResolveBodyBytes > MaxMaxResolveBodyBytes {
+		return fmt.Errorf("config validation: max_resolve_body_bytes must be between %d and %d, got %d",
+			MinMaxResolveBodyBytes, MaxMaxResolveBodyBytes, c.MaxResolveBodyBytes)
 	}
 
 	if c.ParticipantTokenTTL < MinParticipantTokenTTL || c.ParticipantTokenTTL > MaxParticipantTokenTTL {

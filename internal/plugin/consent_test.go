@@ -25,6 +25,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -302,6 +303,7 @@ func newTestConfig(consentAPIURL, resolverURL string) *Config {
 		OwnerResolverTimeout:    DefaultOwnerResolverTimeout,
 		ResponsePhaseTimeout:    DefaultResponsePhaseTimeout,
 		MaxOwnersPerResponse:    DefaultMaxOwnersPerResponse,
+		MaxResolveBodyBytes:     DefaultMaxResolveBodyBytes,
 		ConsumerClaim:           DefaultConsumerClaim,
 		JWTHeaderName:           DefaultJWTHeaderName,
 		ConsentKey:              "test-consent-key",
@@ -1164,4 +1166,31 @@ func TestResponseContentType(t *testing.T) {
 		resp.header.Del("Content-Type")
 		assert.Empty(t, responseContentType(resp))
 	})
+}
+
+// TestResponseFilter_BodyCapDenies verifies an oversized upstream body is denied
+// rather than forwarded. The resolver call holds the body whole, validates it
+// and marshals it again, so forwarding a large collection response multiplies
+// the runner's memory on top of APISIX's own buffering.
+func TestResponseFilter_BodyCapDenies(t *testing.T) {
+	clearContextStore()
+
+	server := newUncalledConsentManager(t)
+	defer server.Close()
+	resolver := newUncalledOwnerResolver(t)
+	defer resolver.Close()
+
+	cfg := newTestConfig(server.URL, resolver.URL+"/resolve")
+	cfg.MaxResolveBodyBytes = 32
+	// The cap is a deliberate limit, not an outage, so fail_open must not lift it.
+	cfg.FailOpen = boolPtr(true)
+
+	const id = uint32(250)
+	storeRequest(id)
+	resp := newMockResponse(id, []byte(`{"padding":"`+strings.Repeat("x", 64)+`"}`))
+
+	(&ConsentFilter{}).ResponseFilter(cfg, resp)
+
+	assert.Equal(t, DefaultDenyStatusCode, resp.writtenStatus,
+		"a body too large to examine must be denied, not forwarded")
 }

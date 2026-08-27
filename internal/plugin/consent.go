@@ -295,6 +295,17 @@ func (c *ConsentFilter) evaluateWithResolver(cfg *Config, w pkgHTTP.Response, ke
 		return failOutcome(cfg, failByPolicy, "read upstream body: "+err.Error(), key, nil)
 	}
 
+	if len(body) > cfg.MaxResolveBodyBytes {
+		// Forwarding it would copy the body twice more (json.Valid, then the
+		// marshalled envelope) on top of APISIX's own buffering. Deny instead:
+		// a body too large to examine is not a body we can vouch for.
+		logging.WarnfEvery("resolve-body-cap", "ResponseFilter: upstream body of %d bytes for request %s exceeds max_resolve_body_bytes=%d; denying",
+			len(body), key, cfg.MaxResolveBodyBytes)
+		return failOutcome(cfg, failAlwaysClosed,
+			fmt.Sprintf("upstream body of %d bytes exceeds max_resolve_body_bytes=%d", len(body), cfg.MaxResolveBodyBytes),
+			key, nil)
+	}
+
 	contentType := responseContentType(w)
 
 	// Parties are for CONTRACT identification only - never for ownership. The
