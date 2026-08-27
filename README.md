@@ -294,7 +294,7 @@ versioning rules.
 Each release publishes:
 
 - a multi-arch (`linux/amd64,arm64`) image
-  `quay.io/wi_stefan/consent-plugin:<version>` (also `:latest`, `:<sha>`), and
+  `quay.io/seamware/consent-plugin:<version>` (also `:latest`, `:<sha>`), and
 - standalone `go-runner` binaries (`consent-plugin-linux-{amd64,arm64}`) on the
   GitHub Release.
 
@@ -307,7 +307,7 @@ APISIX launches it as the external plugin runner:
 ```yaml
 initContainers:
   - name: install-consent-plugin
-    image: quay.io/wi_stefan/consent-plugin:<version>
+    image: quay.io/seamware/consent-plugin:<version>
     command: ["cp", "/app/go-runner", "/ext-plugin/go-runner"]
     volumeMounts:
       - name: ext-plugin-bin

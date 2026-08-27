@@ -52,7 +52,7 @@ On merge to `main`, `main.yml` re-runs the gates and calls `release.yml`, which:
 
 1. computes the next version from the label,
 2. builds, scans and pushes the multi-arch image to
-   `quay.io/wi_stefan/consent-plugin`, and
+   `quay.io/seamware/consent-plugin`, and
 3. publishes a GitHub Release with the `go-runner` binaries.
 
 While a PR is open, `pre-release.yml` publishes a `…-PRE-<pr>` image and a GitHub

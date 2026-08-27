@@ -4,7 +4,7 @@
 BINARY_NAME := go-runner
 
 # Docker image configuration
-DOCKER_IMAGE := quay.io/wi_stefan/consent-plugin
+DOCKER_IMAGE := quay.io/seamware/consent-plugin
 DOCKER_TAG := 0.0.1
 
 # Go build flags

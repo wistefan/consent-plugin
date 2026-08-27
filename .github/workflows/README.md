@@ -22,7 +22,7 @@ structure: quality gates run on every PR and on `main`, and releases are
 
 Each release produces:
 
-- **Container image** — `quay.io/wi_stefan/consent-plugin:<version>` (plus `:latest`
+- **Container image** — `quay.io/seamware/consent-plugin:<version>` (plus `:latest`
   and `:<sha>`), multi-arch `linux/amd64,linux/arm64`. **This is the primary
   deployment artifact**: the APISIX deployment's init container copies
   `/app/go-runner` out of the image into the `ext-plugin` volume
