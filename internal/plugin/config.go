@@ -20,10 +20,10 @@
 package plugin
 
 import (
+	"consent-plugin/internal/logging"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
 	"net/url"
 	"os"
 	"strings"
@@ -458,7 +458,7 @@ func ParseConfig(in []byte) (*Config, error) {
 	}
 
 	if conf.IsFailOpen() {
-		log.Printf("[consent-filter] WARNING: fail_open is enabled for %s — a consent-manager or resolver outage will RELEASE personal data instead of denying it",
+		logging.Warnf("fail_open is enabled for %s — a consent-manager or resolver outage will RELEASE personal data instead of denying it",
 			conf.ConsentAPIURL)
 	}
 

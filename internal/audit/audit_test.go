@@ -22,7 +22,6 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -182,38 +181,6 @@ func TestEmitSendsConfiguredHeaders(t *testing.T) {
 		assert.Equal(t, "application/json", h.Get("Content-Type"))
 	case <-time.After(time.Second):
 		t.Fatal("the Collector never received an export")
-	}
-}
-
-// TestSanitizeReason verifies an upstream error body spliced into a reason
-// cannot reach the audit sink verbatim: control characters are collapsed and the
-// result is bounded.
-func TestSanitizeReason(t *testing.T) {
-	tests := []struct {
-		name   string
-		reason string
-		want   string
-	}{
-		{name: "empty", reason: "", want: ""},
-		{name: "plain reason is untouched", reason: "no granted consent", want: "no granted consent"},
-		{
-			name:   "newlines and tabs collapse to single spaces",
-			reason: "consent check error:\n\t{\"error\":\"boom\"}\r\n",
-			want:   `consent check error: {"error":"boom"}`,
-		},
-		{
-			name:   "an over-long reason is truncated and marked",
-			reason: "x" + strings.Repeat("y", 500),
-			want:   "x" + strings.Repeat("y", maxReasonLength-len(reasonRedaction)-1) + reasonRedaction,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := SanitizeReason(tt.reason)
-			assert.Equal(t, tt.want, got)
-			assert.LessOrEqual(t, len(got), maxReasonLength)
-		})
 	}
 }
 

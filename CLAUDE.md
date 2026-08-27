@@ -54,6 +54,9 @@ consent-plugin/
 │   ├── audit/
 │   │   ├── audit.go           # OTLP/HTTP access-decision audit exporter
 │   │   └── audit_test.go      # Unit tests for the audit exporter
+│   ├── logging/
+│   │   ├── logging.go         # Leveled logging front end: redaction, sanitisation, rate limiting
+│   │   └── logging_test.go    # Unit tests for the logging front end
 │   ├── jwt/
 │   │   ├── extractor.go       # JWT extraction and claim decoding (no verification)
 │   │   └── extractor_test.go  # Unit tests for JWT extraction
@@ -114,6 +117,10 @@ make docker-build
   the two-call check (`/users/identifier/search` + `/consents/participants/{id}`).
   A consent counts only if it is granted **to the named consumer** (and covers
   the purpose/resource when known).
+- `internal/logging/logging.go` — Logging front end over the runner's zap logger:
+  `Redact` fingerprints identifiers, `Sanitize` strips error bodies, and the
+  `*Every` variants rate-limit a repeated failure to one line per interval.
+  Nothing in the plugin calls `log.Printf` directly.
 - `internal/audit/audit.go` — Access-decision audit emitter: one OTLP/HTTP log
   record per decision to the OTel Collector (`service.name=consent-access-audit`
   for routing). Async, batched, best-effort; gated by `audit_enabled` +

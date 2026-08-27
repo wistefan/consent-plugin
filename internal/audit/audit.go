@@ -30,9 +30,9 @@ package audit
 
 import (
 	"bytes"
+	"consent-plugin/internal/logging"
 	"context"
 	"encoding/json"
-	"log"
 	"net/http"
 	"sort"
 	"strconv"
@@ -40,7 +40,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-	"unicode"
 )
 
 // DefaultServiceName is the resource service.name stamped on audit records when
@@ -233,7 +232,7 @@ func (e *Emitter) Emit(ev Event) {
 	case e.queue <- ev:
 	default:
 		if n := e.dropped.Add(1); n%droppedLogEvery == 1 {
-			log.Printf("[consent-filter] audit queue full, dropping event (total dropped %d)", n)
+			logging.Warnf("audit queue full, dropping event (total dropped %d)", n)
 		}
 	}
 }
@@ -258,15 +257,8 @@ func Dropped() uint64 {
 	return total
 }
 
-// maxReasonLength bounds an exported reason. Reasons are short explanations; a
-// long one means an upstream error body has been spliced into it.
-const maxReasonLength = 200
-
 // droppedLogEvery rate-limits the queue-full log line.
 const droppedLogEvery = 100
-
-// reasonRedaction replaces the tail of an over-long reason.
-const reasonRedaction = "...(redacted)"
 
 // SanitizeReason makes a decision reason safe to export: control characters
 // (including the newlines of an HTML or JSON error page) are collapsed to
@@ -276,19 +268,7 @@ const reasonRedaction = "...(redacted)"
 // consent-manager's response body — which can carry identifiers or other
 // personal data. Exporting it verbatim would push exactly the data the audit
 // pipeline exists to keep controlled into the audit sink.
-func SanitizeReason(reason string) string {
-	cleaned := strings.Map(func(r rune) rune {
-		if unicode.IsControl(r) {
-			return ' '
-		}
-		return r
-	}, reason)
-	cleaned = strings.Join(strings.Fields(cleaned), " ")
-	if len(cleaned) > maxReasonLength {
-		return cleaned[:maxReasonLength-len(reasonRedaction)] + reasonRedaction
-	}
-	return cleaned
-}
+func SanitizeReason(reason string) string { return logging.Sanitize(reason) }
 
 // Shutdown stops the background worker after flushing everything still queued.
 // Intended for clean teardown and tests; the plugin runner is long-lived and
@@ -341,14 +321,14 @@ func (e *Emitter) run() {
 func (e *Emitter) export(batch []Event) {
 	body, err := json.Marshal(e.buildPayload(batch))
 	if err != nil {
-		log.Printf("[consent-filter] audit: failed to marshal %d event(s): %v", len(batch), err)
+		logging.Errorf("audit: failed to marshal %d event(s): %s", len(batch), logging.Sanitize(err.Error()))
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), e.client.Timeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, e.endpoint, bytes.NewReader(body))
 	if err != nil {
-		log.Printf("[consent-filter] audit: failed to build request: %v", err)
+		logging.Errorf("audit: failed to build the export request: %s", logging.Sanitize(err.Error()))
 		return
 	}
 	req.Header.Set("Content-Type", "application/json")
@@ -357,12 +337,12 @@ func (e *Emitter) export(batch []Event) {
 	}
 	resp, err := e.client.Do(req)
 	if err != nil {
-		log.Printf("[consent-filter] audit: export to %s failed: %v", e.endpoint, err)
+		logging.ErrorfEvery("audit-export", "audit: export to %s failed: %s", e.endpoint, logging.Sanitize(err.Error()))
 		return
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode >= http.StatusMultipleChoices {
-		log.Printf("[consent-filter] audit: export to %s returned HTTP %d", e.endpoint, resp.StatusCode)
+		logging.ErrorfEvery("audit-export-status", "audit: export to %s returned HTTP %d", e.endpoint, resp.StatusCode)
 	}
 }
 

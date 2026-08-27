@@ -23,11 +23,11 @@ import (
 	"consent-plugin/internal/audit"
 	"consent-plugin/internal/consent"
 	"consent-plugin/internal/jwt"
+	"consent-plugin/internal/logging"
 	"consent-plugin/internal/ownerresolver"
 	"context"
 	"errors"
 	"fmt"
-	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -103,7 +103,7 @@ func (c *ConsentFilter) ParseConf(in []byte) (interface{}, error) {
 func (c *ConsentFilter) RequestFilter(conf interface{}, w http.ResponseWriter, r pkgHTTP.Request) {
 	cfg, ok := conf.(*Config)
 	if !ok {
-		log.Printf("[consent-filter] RequestFilter: invalid config type, skipping request %d", r.ID())
+		logging.Errorf("RequestFilter: invalid config type, skipping request %d", r.ID())
 		return
 	}
 
@@ -121,13 +121,13 @@ func (c *ConsentFilter) RequestFilter(conf interface{}, w http.ResponseWriter, r
 	if jwtHeaderValue != "" {
 		token, err := jwt.ExtractToken(jwtHeaderValue)
 		if err != nil {
-			log.Printf("[consent-filter] RequestFilter: failed to extract JWT from header %q for request %d: %v",
-				cfg.JWTHeaderName, r.ID(), err)
+			logging.WarnfEvery("jwt-extract", "RequestFilter: failed to extract JWT from header %q: %s",
+				cfg.JWTHeaderName, logging.Sanitize(err.Error()))
 		} else {
 			claims, err := jwt.DecodeClaims(token, claimKeysToDecode(cfg))
 			if err != nil {
-				log.Printf("[consent-filter] RequestFilter: failed to decode JWT claims for request %d: %v",
-					r.ID(), err)
+				logging.WarnfEvery("jwt-decode", "RequestFilter: failed to decode JWT claims: %s",
+					logging.Sanitize(err.Error()))
 			} else {
 				reqCtx.JWTClaims = claims
 			}
@@ -138,8 +138,8 @@ func (c *ConsentFilter) RequestFilter(conf interface{}, w http.ResponseWriter, r
 	// the runner's per-RPC ID() (which differs between pre-req and post-resp).
 	key, ok := correlationKey(r)
 	if !ok {
-		log.Printf("[consent-filter] RequestFilter: could not read %q for request %d; consent context not stored",
-			nginxRequestIDVar, r.ID())
+		logging.ErrorfEvery("no-request-id-req", "RequestFilter: could not read %q; consent context not stored",
+			nginxRequestIDVar)
 		return
 	}
 
@@ -202,7 +202,7 @@ type checkedOwner struct {
 func (c *ConsentFilter) ResponseFilter(conf interface{}, w pkgHTTP.Response) {
 	cfg, ok := conf.(*Config)
 	if !ok {
-		log.Printf("[consent-filter] ResponseFilter: invalid config type, skipping request %d", w.ID())
+		logging.Errorf("ResponseFilter: invalid config type, skipping request %d", w.ID())
 		return
 	}
 
@@ -221,7 +221,7 @@ func (c *ConsentFilter) evaluate(cfg *Config, w pkgHTTP.Response) responseOutcom
 	// Correlate with the request phase via the stable Nginx $request_id.
 	key, ok := correlationKey(w)
 	if !ok {
-		log.Printf("[consent-filter] ResponseFilter: could not read %q for request %d; cannot verify consent", nginxRequestIDVar, w.ID())
+		logging.ErrorfEvery("no-request-id-resp", "ResponseFilter: could not read %q; cannot verify consent", nginxRequestIDVar)
 		return failOutcome(cfg, failAlwaysClosed, "no request correlation id", "", nil)
 	}
 
@@ -231,7 +231,7 @@ func (c *ConsentFilter) evaluate(cfg *Config, w pkgHTTP.Response) responseOutcom
 		// The request phase did not capture context for this request; the
 		// consent decision cannot be made, so honor the fail policy instead
 		// of silently passing the response through.
-		log.Printf("[consent-filter] ResponseFilter: no request context found for request %s; cannot verify consent", key)
+		logging.WarnfEvery("no-request-context", "ResponseFilter: no request context found for request %s; cannot verify consent", key)
 		return failOutcome(cfg, failAlwaysClosed, "no request context", key, nil)
 	}
 
@@ -255,7 +255,7 @@ func (c *ConsentFilter) evaluateWithResolver(cfg *Config, w pkgHTTP.Response, ke
 
 	body, err := w.ReadBody()
 	if err != nil {
-		log.Printf("[consent-filter] ResponseFilter: could not read upstream body for request %s: %v", key, err)
+		logging.ErrorfEvery("read-body", "ResponseFilter: could not read the upstream body for request %s: %s", key, logging.Sanitize(err.Error()))
 		return failOutcome(cfg, failByPolicy, "read upstream body: "+err.Error(), key, nil)
 	}
 
@@ -277,12 +277,12 @@ func (c *ConsentFilter) evaluateWithResolver(cfg *Config, w pkgHTTP.Response, ke
 	resolveParties := ownerresolver.Parties{}
 	consumerDID, claimErr := consumerFromClaims(reqCtx.JWTClaims, cfg.ConsumerClaim)
 	if claimErr != nil {
-		log.Printf("[consent-filter] ResponseFilter: could not read the consuming participant for request %s: %v", key, claimErr)
+		logging.WarnfEvery("consumer-claim", "ResponseFilter: could not read the consuming participant for request %s: %s", key, logging.Sanitize(claimErr.Error()))
 		return failOutcome(cfg, failAlwaysClosed, "no consuming participant identified: "+claimErr.Error(), key, nil)
 	}
 	consumerSD, sdErr := consentClient.ParticipantSelfDescriptionByDID(phaseCtx, consumerDID)
 	if sdErr != nil {
-		log.Printf("[consent-filter] ResponseFilter: could not map the consumer to a participant for request %s: %v", key, sdErr)
+		logging.WarnfEvery("consumer-lookup", "ResponseFilter: could not map the consumer to a participant for request %s: %s", key, logging.Sanitize(sdErr.Error()))
 		return failOutcome(cfg, failModeForError(sdErr), "consumer participant lookup failed: "+sdErr.Error(), key, nil)
 	}
 	// The consumer also scopes the consent match itself: a consent names the one
@@ -292,7 +292,7 @@ func (c *ConsentFilter) evaluateWithResolver(cfg *Config, w pkgHTTP.Response, ke
 
 	providerSD, sdErr := consentClient.ProviderSelfDescription(phaseCtx)
 	if sdErr != nil {
-		log.Printf("[consent-filter] ResponseFilter: could not determine the provider self-description for request %s: %v", key, sdErr)
+		logging.ErrorfEvery("provider-sd", "ResponseFilter: could not determine the provider self-description for request %s: %s", key, logging.Sanitize(sdErr.Error()))
 		return failOutcome(cfg, failModeForError(sdErr), "provider self-description lookup failed: "+sdErr.Error(), key, nil)
 	}
 	resolveParties.Provider = providerSD
@@ -305,7 +305,7 @@ func (c *ConsentFilter) evaluateWithResolver(cfg *Config, w pkgHTTP.Response, ke
 		ContentType: contentType,
 	}, resolveParties, body)
 	if err != nil {
-		log.Printf("[consent-filter] ResponseFilter: owner resolver error for request %s: %v", key, err)
+		logging.ErrorfEvery("resolver-error", "ResponseFilter: owner resolver error for request %s: %s", key, logging.Sanitize(err.Error()))
 		return failOutcome(cfg, failByPolicy, "owner resolver error: "+err.Error(), key, nil)
 	}
 
@@ -322,7 +322,7 @@ func (c *ConsentFilter) evaluateWithResolver(cfg *Config, w pkgHTTP.Response, ke
 		return failOutcome(cfg, failAlwaysClosed, err.Error(), key, nil)
 	}
 	if len(claims) > cfg.MaxOwnersPerResponse {
-		log.Printf("[consent-filter] ResponseFilter: %d distinct data owners for request %s exceeds max_owners_per_response=%d; denying",
+		logging.WarnfEvery("owner-cap", "ResponseFilter: %d distinct data owners for request %s exceeds max_owners_per_response=%d; denying",
 			len(claims), key, cfg.MaxOwnersPerResponse)
 		return failOutcome(cfg, failAlwaysClosed,
 			fmt.Sprintf("response resolves to %d data owners, above max_owners_per_response=%d", len(claims), cfg.MaxOwnersPerResponse),
@@ -466,7 +466,7 @@ func checkOwners(ctx context.Context, cfg *Config, key string, reqCtx *RequestCo
 			if errors.Is(result.err, context.Canceled) && ctx.Err() == nil {
 				continue
 			}
-			log.Printf("[consent-filter] ResponseFilter: consent check error for request %s: %v", key, result.err)
+			logging.ErrorfEvery("consent-check", "ResponseFilter: consent check error for request %s: %s", key, logging.Sanitize(result.err.Error()))
 			req := result.request
 			outcome := failOutcome(cfg, failModeForError(result.err), "consent check error: "+result.err.Error(), key, &req)
 			outcome.checked = checked
@@ -633,7 +633,7 @@ func denyResponse(w pkgHTTP.Response, cfg *Config) {
 
 	w.WriteHeader(cfg.DenyStatusCode)
 	if _, err := w.Write(body); err != nil {
-		log.Printf("[consent-filter] ResponseFilter: failed to write deny body for request %d: %v", w.ID(), err)
+		logging.Errorf("ResponseFilter: failed to write the deny body for request %d: %s", w.ID(), logging.Sanitize(err.Error()))
 	}
 }
 

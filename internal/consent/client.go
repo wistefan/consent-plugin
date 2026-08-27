@@ -19,6 +19,7 @@ package consent
 
 import (
 	"bytes"
+	"consent-plugin/internal/logging"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -492,8 +493,12 @@ func (c *Client) ParticipantSelfDescriptionByDID(ctx context.Context, did string
 
 // notRegistered builds the "no such participant" error, wrapping the sentinel so
 // callers can tell a misconfigured DID from an unreachable registry.
+//
+// The DID is fingerprinted rather than embedded: this error is both logged to
+// stdout and used as an audit reason, and a participant DID is an identifier
+// that belongs in the audit record's own field, not in free text.
 func notRegistered(did string) error {
-	return fmt.Errorf("%w: no participant registered for did %q", ErrParticipantNotRegistered, did)
+	return fmt.Errorf("%w: no participant registered for did %s", ErrParticipantNotRegistered, logging.Redact(did))
 }
 
 // lookupParticipantSD fetches the participant registry and returns the

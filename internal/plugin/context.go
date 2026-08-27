@@ -18,8 +18,8 @@
 package plugin
 
 import (
+	"consent-plugin/internal/logging"
 	"fmt"
-	"log"
 	"sync"
 	"time"
 )
@@ -109,7 +109,7 @@ func startContextJanitor() {
 			defer ticker.Stop()
 			for range ticker.C {
 				if n := sweepRequestContexts(time.Now()); n > 0 {
-					log.Printf("[consent-filter] request-context store: evicted %d expired entr(ies), %d remaining",
+					logging.Warnf("request-context store: evicted %d expired entr(ies), %d remaining",
 						n, RequestContextStoreSize())
 				}
 			}
@@ -143,7 +143,7 @@ func StoreRequestContext(requestKey string, ctx *RequestContext) {
 // requestContextMu.
 func evictForSpaceLocked(now time.Time) {
 	if n := sweepLocked(now); n > 0 {
-		log.Printf("[consent-filter] request-context store full (%d), evicted %d expired entr(ies)", MaxRequestContexts, n)
+		logging.WarnfEvery("context-store-full", "request-context store full (%d), evicted %d expired entr(ies)", MaxRequestContexts, n)
 		return
 	}
 	oldestKey, oldestAt := "", time.Time{}
@@ -155,7 +155,7 @@ func evictForSpaceLocked(now time.Time) {
 	if oldestKey != "" {
 		delete(requestContextStore, oldestKey)
 		contextsEvicted++
-		log.Printf("[consent-filter] request-context store full (%d) with no expired entries, evicted the oldest", MaxRequestContexts)
+		logging.ErrorfEvery("context-store-overflow", "request-context store full (%d) with no expired entries, evicted the oldest", MaxRequestContexts)
 	}
 }
 
