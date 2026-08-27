@@ -275,10 +275,10 @@ func (c *ConsentFilter) evaluateWithResolver(cfg *Config, w pkgHTTP.Response, ke
 	// put a fail-open seam in the middle of a fail-closed design, reachable by
 	// nothing more than a briefly unreachable consent-manager or a revoked token.
 	resolveParties := ownerresolver.Parties{}
-	consumerDID := consumerFromClaims(reqCtx.JWTClaims, cfg.ConsumerClaim)
-	if consumerDID == "" {
-		log.Printf("[consent-filter] ResponseFilter: no consuming participant in the token claims (path %q) for request %s", cfg.ConsumerClaim, key)
-		return failOutcome(cfg, failAlwaysClosed, "no consuming participant identified", key, nil)
+	consumerDID, claimErr := consumerFromClaims(reqCtx.JWTClaims, cfg.ConsumerClaim)
+	if claimErr != nil {
+		log.Printf("[consent-filter] ResponseFilter: could not read the consuming participant for request %s: %v", key, claimErr)
+		return failOutcome(cfg, failAlwaysClosed, "no consuming participant identified: "+claimErr.Error(), key, nil)
 	}
 	consumerSD, sdErr := consentClient.ParticipantSelfDescriptionByDID(phaseCtx, consumerDID)
 	if sdErr != nil {
@@ -660,7 +660,7 @@ func claimKeysToDecode(cfg *Config) []string {
 	if cfg.ConsumerClaim == "" {
 		return keys
 	}
-	root := strings.SplitN(cfg.ConsumerClaim, claimPathSeparator, 2)[0]
+	root := claimPathRoot(cfg.ConsumerClaim)
 	for _, k := range keys {
 		if k == root {
 			return keys
@@ -669,30 +669,129 @@ func claimKeysToDecode(cfg *Config) []string {
 	return append(keys, root)
 }
 
-// claimPathSeparator separates the segments of a dotted claim path.
-const claimPathSeparator = "."
+// Claim-path syntax. A path is dot-separated segments, each optionally followed
+// by bracketed array indices, e.g. "verifiableCredential[0].issuer".
+const (
+	// claimPathSeparator separates the segments of a dotted claim path.
+	claimPathSeparator = "."
+
+	// claimIndexOpen and claimIndexClose bracket an explicit array index.
+	claimIndexOpen  = "["
+	claimIndexClose = "]"
+
+	// firstElementIndex is the element used when a segment resolves to an array
+	// and the path names no index.
+	firstElementIndex = 0
+)
+
+// errClaimPathUnset signals that no consumer claim path is configured, as
+// distinct from a configured path that did not resolve. Both deny, but only one
+// is a configuration mistake worth reporting as such.
+var errClaimPathUnset = errors.New("consumer_claim is not configured")
 
 // consumerFromClaims reads the consuming participant from a dotted claim path
-// (e.g. "verifiableCredential.issuer"). It returns "" when the path is unset or
-// does not resolve to a string, which the caller treats as a failure to identify
-// the exchange - the fail policy then applies.
-func consumerFromClaims(claims map[string]interface{}, path string) string {
-	if len(claims) == 0 || path == "" {
-		return ""
+// (e.g. "verifiableCredential.issuer").
+//
+// A Verifiable Presentation commonly carries "verifiableCredential" as a JSON
+// ARRAY, so a walk that only ever descends into objects fails on an ordinary
+// token — silently, returning "" with no indication of which segment gave up.
+// Two forms of array traversal are therefore supported: an explicit index
+// ("verifiableCredential[0].issuer"), and an implicit first element when a bare
+// segment lands on an array.
+//
+// The error names the segment that failed, so a mistyped path is diagnosable
+// rather than appearing as a consumer that simply is not there.
+func consumerFromClaims(claims map[string]interface{}, path string) (string, error) {
+	if path == "" {
+		return "", errClaimPathUnset
 	}
+	if len(claims) == 0 {
+		return "", errors.New("no claims decoded from the token")
+	}
+
 	var current interface{} = claims
 	for _, segment := range strings.Split(path, claimPathSeparator) {
-		node, ok := current.(map[string]interface{})
-		if !ok {
-			return ""
+		name, indices, err := parseClaimSegment(segment)
+		if err != nil {
+			return "", err
 		}
-		current, ok = node[segment]
-		if !ok {
-			return ""
+		if name != "" {
+			node, ok := descendIntoObject(current)
+			if !ok {
+				return "", fmt.Errorf("claim path %q: %q is not an object", path, segment)
+			}
+			current, ok = node[name]
+			if !ok {
+				return "", fmt.Errorf("claim path %q: no claim %q", path, name)
+			}
+		}
+		for _, index := range indices {
+			array, ok := current.([]interface{})
+			if !ok {
+				return "", fmt.Errorf("claim path %q: %q is not an array", path, name)
+			}
+			if index >= len(array) {
+				return "", fmt.Errorf("claim path %q: index %d is out of range (%d element(s))", path, index, len(array))
+			}
+			current = array[index]
 		}
 	}
-	if s, ok := current.(string); ok {
-		return s
+
+	if value, ok := current.(string); ok && value != "" {
+		return value, nil
 	}
-	return ""
+	return "", fmt.Errorf("claim path %q did not resolve to a non-empty string", path)
+}
+
+// descendIntoObject returns node as an object, stepping into the first element
+// of an array first. A Verifiable Presentation's "verifiableCredential" is
+// routinely an array of one, and requiring an explicit "[0]" for that common
+// shape would make the default path wrong for most real tokens.
+func descendIntoObject(node interface{}) (map[string]interface{}, bool) {
+	if array, ok := node.([]interface{}); ok {
+		if len(array) == 0 {
+			return nil, false
+		}
+		node = array[firstElementIndex]
+	}
+	object, ok := node.(map[string]interface{})
+	return object, ok
+}
+
+// parseClaimSegment splits one path segment into its claim name and any explicit
+// array indices, e.g. "verifiableCredential[0]" -> ("verifiableCredential", [0]).
+func parseClaimSegment(segment string) (name string, indices []int, err error) {
+	name, rest, found := strings.Cut(segment, claimIndexOpen)
+	if !found {
+		return segment, nil, nil
+	}
+	for rest != "" {
+		digits, remainder, closed := strings.Cut(rest, claimIndexClose)
+		if !closed {
+			return "", nil, fmt.Errorf("claim path segment %q: unterminated %q", segment, claimIndexOpen)
+		}
+		index, convErr := strconv.Atoi(digits)
+		if convErr != nil || index < 0 {
+			return "", nil, fmt.Errorf("claim path segment %q: %q is not an array index", segment, digits)
+		}
+		indices = append(indices, index)
+		if remainder == "" {
+			break
+		}
+		if !strings.HasPrefix(remainder, claimIndexOpen) {
+			return "", nil, fmt.Errorf("claim path segment %q: unexpected %q after an index", segment, remainder)
+		}
+		rest = strings.TrimPrefix(remainder, claimIndexOpen)
+	}
+	return name, indices, nil
+}
+
+// claimPathRoot returns the first claim name in a dotted path, without any array
+// index, so the request phase knows which top-level claim to decode.
+func claimPathRoot(path string) string {
+	root := strings.SplitN(path, claimPathSeparator, 2)[0]
+	if name, _, found := strings.Cut(root, claimIndexOpen); found {
+		return name
+	}
+	return root
 }

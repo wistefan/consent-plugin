@@ -983,3 +983,122 @@ func TestRecordAudit_RecordsOutcomeWhenNoOwnerReached(t *testing.T) {
 	defer mu.Unlock()
 	assert.Equal(t, 1, records, "a failure before any owner was reached must still be recorded")
 }
+
+// TestConsumerFromClaims covers the claim-path walk, including the array shapes
+// a real Verifiable Presentation uses. An object-only walk returned "" on an
+// ordinary VP token, which fed straight into the fail-closed party seam and made
+// every such request deny for no visible reason.
+func TestConsumerFromClaims(t *testing.T) {
+	const issuer = "did:key:zIssuer"
+
+	objectClaims := map[string]interface{}{
+		"verifiableCredential": map[string]interface{}{"issuer": issuer},
+	}
+	arrayClaims := map[string]interface{}{
+		"verifiableCredential": []interface{}{
+			map[string]interface{}{"issuer": issuer},
+			map[string]interface{}{"issuer": "did:key:zOther"},
+		},
+	}
+
+	tests := []struct {
+		name      string
+		claims    map[string]interface{}
+		path      string
+		want      string
+		wantErr   bool
+		errSubstr string
+	}{
+		{name: "object shape", claims: objectClaims, path: "verifiableCredential.issuer", want: issuer},
+		{name: "array shape traverses the first element", claims: arrayClaims, path: "verifiableCredential.issuer", want: issuer},
+		{name: "explicit index", claims: arrayClaims, path: "verifiableCredential[0].issuer", want: issuer},
+		{name: "explicit non-zero index", claims: arrayClaims, path: "verifiableCredential[1].issuer", want: "did:key:zOther"},
+		{name: "single segment", claims: map[string]interface{}{"iss": issuer}, path: "iss", want: issuer},
+		{
+			name:   "nested arrays",
+			claims: map[string]interface{}{"a": []interface{}{[]interface{}{map[string]interface{}{"b": issuer}}}},
+			path:   "a[0][0].b",
+			want:   issuer,
+		},
+		{
+			name:   "unset path is reported as unconfigured",
+			claims: objectClaims, path: "",
+			wantErr: true, errSubstr: "not configured",
+		},
+		{
+			name:   "no claims at all",
+			claims: nil, path: "verifiableCredential.issuer",
+			wantErr: true, errSubstr: "no claims decoded",
+		},
+		{
+			name:   "missing claim names the segment",
+			claims: objectClaims, path: "verifiableCredential.subject",
+			wantErr: true, errSubstr: `no claim "subject"`,
+		},
+		{
+			name:   "index out of range",
+			claims: arrayClaims, path: "verifiableCredential[9].issuer",
+			wantErr: true, errSubstr: "out of range",
+		},
+		{
+			name:   "non-string leaf",
+			claims: map[string]interface{}{"iss": float64(42)}, path: "iss",
+			wantErr: true, errSubstr: "non-empty string",
+		},
+		{
+			name:   "empty-string leaf",
+			claims: map[string]interface{}{"iss": ""}, path: "iss",
+			wantErr: true, errSubstr: "non-empty string",
+		},
+		{
+			name:   "descending into a scalar",
+			claims: map[string]interface{}{"iss": issuer}, path: "iss.nested",
+			wantErr: true, errSubstr: "is not an object",
+		},
+		{
+			name:   "empty array",
+			claims: map[string]interface{}{"vc": []interface{}{}}, path: "vc.issuer",
+			wantErr: true, errSubstr: "is not an object",
+		},
+		{
+			name:   "unterminated index",
+			claims: arrayClaims, path: "verifiableCredential[0.issuer",
+			wantErr: true, errSubstr: "unterminated",
+		},
+		{
+			name:   "non-numeric index",
+			claims: arrayClaims, path: "verifiableCredential[first].issuer",
+			wantErr: true, errSubstr: "not an array index",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := consumerFromClaims(tt.claims, tt.path)
+			if tt.wantErr {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tt.errSubstr)
+				assert.Empty(t, got)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+// TestClaimPathRoot verifies the top-level claim the request phase must decode
+// is found even when the path starts with an array index.
+func TestClaimPathRoot(t *testing.T) {
+	tests := []struct{ path, want string }{
+		{"verifiableCredential.issuer", "verifiableCredential"},
+		{"verifiableCredential[0].issuer", "verifiableCredential"},
+		{"iss", "iss"},
+		{"", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.path, func(t *testing.T) {
+			assert.Equal(t, tt.want, claimPathRoot(tt.path))
+		})
+	}
+}
