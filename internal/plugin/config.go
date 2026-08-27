@@ -63,6 +63,19 @@ const (
 	MinOwnerResolverTimeout = 1
 	MaxOwnerResolverTimeout = 60000
 
+	// DefaultParticipantTokenTTL is how long, in seconds, a fetched participant
+	// token is cached when the route does not say. It matches the consent
+	// client's own default.
+	DefaultParticipantTokenTTL = 3000
+
+	// MinParticipantTokenTTL and MaxParticipantTokenTTL bound the token cache
+	// lifetime in seconds. The upper bound is a day — far longer than any token
+	// this plugin is issued — and it also keeps the value away from the range
+	// where `time.Duration(ttl) * time.Second` overflows into a negative
+	// duration, which would make every cached token instantly expired.
+	MinParticipantTokenTTL = 1
+	MaxParticipantTokenTTL = 86400
+
 	// apiPrefixSeparator is the path separator an API prefix must start with. A
 	// prefix without it is silently concatenated into a malformed URL.
 	apiPrefixSeparator = "/"
@@ -223,8 +236,9 @@ type Config struct {
 	TokenAudience string `json:"token_audience,omitempty"`
 
 	// ParticipantTokenTTL caps, in seconds, how long a fetched token is cached
-	// (defaults to 3000s). The token service reports its own lifetime; the
-	// shorter of the two wins. Ignored for a static token.
+	// (defaults to DefaultParticipantTokenTTL). The token service reports its own
+	// lifetime; the shorter of the two wins. Ignored for a static token. Bounded
+	// by Validate, so it cannot overflow when converted to a time.Duration.
 	ParticipantTokenTTL int `json:"participant_token_ttl,omitempty"`
 
 	// ParticipantToken is an optional *static*, pre-obtained access token for the
@@ -313,6 +327,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.MaxOwnersPerResponse == 0 {
 		c.MaxOwnersPerResponse = DefaultMaxOwnersPerResponse
+	}
+	if c.ParticipantTokenTTL == 0 {
+		c.ParticipantTokenTTL = DefaultParticipantTokenTTL
 	}
 	if c.ConsumerClaim == "" {
 		c.ConsumerClaim = DefaultConsumerClaim
@@ -403,6 +420,11 @@ func (c *Config) Validate() error {
 	if c.ResponsePhaseTimeout < MinResponsePhaseTimeout || c.ResponsePhaseTimeout > MaxResponsePhaseTimeout {
 		return fmt.Errorf("config validation: response_phase_timeout must be between %d and %d, got %d",
 			MinResponsePhaseTimeout, MaxResponsePhaseTimeout, c.ResponsePhaseTimeout)
+	}
+
+	if c.ParticipantTokenTTL < MinParticipantTokenTTL || c.ParticipantTokenTTL > MaxParticipantTokenTTL {
+		return fmt.Errorf("config validation: participant_token_ttl must be between %d and %d, got %d",
+			MinParticipantTokenTTL, MaxParticipantTokenTTL, c.ParticipantTokenTTL)
 	}
 
 	if c.MaxOwnersPerResponse < MinMaxOwnersPerResponse || c.MaxOwnersPerResponse > MaxMaxOwnersPerResponse {

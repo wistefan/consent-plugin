@@ -535,8 +535,10 @@ func clientConfigFromCfg(cfg *Config) consent.ClientConfig {
 		ParticipantToken: cfg.ParticipantToken,
 		TokenServiceURL:  cfg.TokenServiceURL,
 		TokenAudience:    cfg.TokenAudience,
-		TokenTTL:         time.Duration(cfg.ParticipantTokenTTL) * time.Second,
-		TimeoutMs:        cfg.ConsentAPITimeout,
+		// Safe to convert: Validate bounds ParticipantTokenTTL well below the
+		// point where the multiplication overflows a time.Duration.
+		TokenTTL:  time.Duration(cfg.ParticipantTokenTTL) * time.Second,
+		TimeoutMs: cfg.ConsentAPITimeout,
 	}
 }
 
