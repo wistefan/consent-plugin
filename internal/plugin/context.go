@@ -19,13 +19,20 @@ package plugin
 
 import (
 	"fmt"
-	"net/http"
+	"log"
 	"sync"
+	"time"
 )
 
 // RequestContext holds the captured request information that is needed
 // during response filtering. It is stored during RequestFilter and
 // retrieved during ResponseFilter.
+//
+// It deliberately holds no request headers. The only thing the response phase
+// needs from the request is the method, the path and the decoded claims; keeping
+// a copy of every header would mean retaining the Authorization bearer token for
+// the lifetime of the entry, which is precisely the wrong thing to leak when an
+// entry outlives its request.
 type RequestContext struct {
 	// Method is the HTTP method of the original request (e.g., "GET", "POST").
 	Method string
@@ -33,76 +40,188 @@ type RequestContext struct {
 	// Path is the URI path of the original request.
 	Path string
 
-	// Headers contains the HTTP headers from the original request.
-	Headers http.Header
-
 	// JWTClaims holds the decoded JWT claims extracted from the configured header.
 	// The map keys are claim names and values are the claim values.
 	JWTClaims map[string]interface{}
 }
 
-// requestContextStore is a package-level concurrent-safe store that maps a
-// stable per-request key to its captured RequestContext. This bridges the
-// RequestFilter and ResponseFilter phases, which APISIX invokes as two
-// separate RPC calls (ext-plugin-pre-req and ext-plugin-post-resp).
+// Bounds on the request-context store. The store bridges two phases of the same
+// HTTP request, so an entry is normally live for the duration of one upstream
+// call. Anything still present well after that belongs to a request whose
+// response phase will never run.
+const (
+	// RequestContextTTL is how long an entry may live before the janitor evicts
+	// it. It must comfortably exceed the upstream response time of a gated route;
+	// evicting too early only means the response phase finds no context and
+	// (fail-closed) denies.
+	RequestContextTTL = 60 * time.Second
+
+	// requestContextSweepInterval is how often the janitor evicts expired entries.
+	requestContextSweepInterval = 10 * time.Second
+
+	// MaxRequestContexts caps how many entries the store may hold. The cap is the
+	// backstop against an unauthenticated memory-exhaustion primitive: a client
+	// that opens requests and aborts before the response leaks one entry each.
+	MaxRequestContexts = 100_000
+)
+
+// storedRequestContext is one entry plus the time it was stored, which is what
+// makes expiry possible.
+type storedRequestContext struct {
+	ctx      *RequestContext
+	storedAt time.Time
+}
+
+// requestContextStore maps a stable per-request key to its captured
+// RequestContext. This bridges the RequestFilter and ResponseFilter phases,
+// which APISIX invokes as two separate RPC calls (ext-plugin-pre-req and
+// ext-plugin-post-resp).
 //
 // The key MUST be stable across those two phases for the same HTTP request.
 // The runner's per-RPC id (Request.ID()/Response.ID()) is NOT stable between
 // them, so the Nginx `$request_id` variable is used instead (see
 // correlationKey in consent.go).
-var requestContextStore sync.Map
+//
+// Entries are normally removed by LoadAndDeleteRequestContext in the response
+// phase. That phase does not always run — the client disconnects, the upstream
+// times out, an earlier plugin short-circuits the request, ext-plugin-post-resp
+// is not attached to the route — and the runner is a long-lived process, so
+// without a TTL and a cap the map grows monotonically until the runner is OOM
+// killed. Both are enforced here.
+var (
+	requestContextMu    sync.Mutex
+	requestContextStore = map[string]storedRequestContext{}
+	// contextsEvicted counts entries removed because they expired or because the
+	// store was full, i.e. requests whose response phase never ran. A number that
+	// climbs in production means requests are being lost, or the store is being
+	// driven deliberately.
+	contextsEvicted uint64
+	janitorOnce     sync.Once
+)
+
+// startContextJanitor launches the background sweep exactly once. It is started
+// lazily from the first Store so that importing the package (as tests and the
+// runner registration do) never leaves a goroutine running for nothing.
+func startContextJanitor() {
+	janitorOnce.Do(func() {
+		go func() {
+			ticker := time.NewTicker(requestContextSweepInterval)
+			defer ticker.Stop()
+			for range ticker.C {
+				if n := sweepRequestContexts(time.Now()); n > 0 {
+					log.Printf("[consent-filter] request-context store: evicted %d expired entr(ies), %d remaining",
+						n, RequestContextStoreSize())
+				}
+			}
+		}()
+	})
+}
 
 // StoreRequestContext saves a RequestContext for the given request key.
 // It overwrites any previously stored context for the same key.
+//
+// The store is bounded: when it is full, expired entries are swept first and,
+// failing that, the oldest entry is evicted so a new request is never refused
+// service by a leak from an older one.
 func StoreRequestContext(requestKey string, ctx *RequestContext) {
-	requestContextStore.Store(requestKey, ctx)
+	startContextJanitor()
+
+	requestContextMu.Lock()
+	defer requestContextMu.Unlock()
+
+	now := time.Now()
+	if len(requestContextStore) >= MaxRequestContexts {
+		if _, replacing := requestContextStore[requestKey]; !replacing {
+			evictForSpaceLocked(now)
+		}
+	}
+	requestContextStore[requestKey] = storedRequestContext{ctx: ctx, storedAt: now}
 }
 
-// LoadRequestContext retrieves the stored RequestContext for the given
-// request key. Returns the context and true if found, or nil and false
-// if no context exists for that key.
-func LoadRequestContext(requestKey string) (*RequestContext, bool) {
-	val, ok := requestContextStore.Load(requestKey)
-	if !ok {
-		return nil, false
+// evictForSpaceLocked makes room in a full store: expired entries first, then —
+// if everything is still live — the single oldest entry. Callers must hold
+// requestContextMu.
+func evictForSpaceLocked(now time.Time) {
+	if n := sweepLocked(now); n > 0 {
+		log.Printf("[consent-filter] request-context store full (%d), evicted %d expired entr(ies)", MaxRequestContexts, n)
+		return
 	}
-
-	ctx, ok := val.(*RequestContext)
-	if !ok {
-		return nil, false
+	oldestKey, oldestAt := "", time.Time{}
+	for key, entry := range requestContextStore {
+		if oldestAt.IsZero() || entry.storedAt.Before(oldestAt) {
+			oldestKey, oldestAt = key, entry.storedAt
+		}
 	}
-
-	return ctx, true
+	if oldestKey != "" {
+		delete(requestContextStore, oldestKey)
+		contextsEvicted++
+		log.Printf("[consent-filter] request-context store full (%d) with no expired entries, evicted the oldest", MaxRequestContexts)
+	}
 }
 
-// DeleteRequestContext removes the stored RequestContext for the given
-// request key. This should be called after the context has been consumed
-// during ResponseFilter to prevent memory leaks.
-func DeleteRequestContext(requestKey string) {
-	requestContextStore.Delete(requestKey)
+// sweepRequestContexts removes every entry stored more than RequestContextTTL
+// before now and returns how many were removed.
+func sweepRequestContexts(now time.Time) int {
+	requestContextMu.Lock()
+	defer requestContextMu.Unlock()
+	return sweepLocked(now)
+}
+
+// sweepLocked is sweepRequestContexts for a caller already holding the mutex.
+func sweepLocked(now time.Time) int {
+	evicted := 0
+	for key, entry := range requestContextStore {
+		if now.Sub(entry.storedAt) > RequestContextTTL {
+			delete(requestContextStore, key)
+			evicted++
+		}
+	}
+	contextsEvicted += uint64(evicted)
+	return evicted
+}
+
+// RequestContextStoreSize reports how many request contexts are currently held.
+// It is the gauge that makes a leak observable: in a healthy runner it tracks
+// the number of in-flight gated requests and returns to zero when idle.
+func RequestContextStoreSize() int {
+	requestContextMu.Lock()
+	defer requestContextMu.Unlock()
+	return len(requestContextStore)
+}
+
+// RequestContextsEvicted reports how many contexts have been evicted because
+// they expired or the store was full — i.e. how many requests never reached
+// their response phase.
+func RequestContextsEvicted() uint64 {
+	requestContextMu.Lock()
+	defer requestContextMu.Unlock()
+	return contextsEvicted
 }
 
 // LoadAndDeleteRequestContext atomically loads and removes the stored
-// RequestContext for the given request key. This is the preferred method
-// for consuming context during ResponseFilter as it combines retrieval
-// and cleanup in a single operation.
+// RequestContext for the given request key. This is how the response phase
+// consumes a context: retrieval and cleanup in a single operation. An entry that
+// has outlived RequestContextTTL is reported as absent (and removed), so a
+// stale context can never decide a fresh request.
 func LoadAndDeleteRequestContext(requestKey string) (*RequestContext, bool) {
-	val, ok := requestContextStore.LoadAndDelete(requestKey)
+	requestContextMu.Lock()
+	defer requestContextMu.Unlock()
+
+	entry, ok := requestContextStore[requestKey]
 	if !ok {
 		return nil, false
 	}
-
-	ctx, ok := val.(*RequestContext)
-	if !ok {
+	delete(requestContextStore, requestKey)
+	if time.Since(entry.storedAt) > RequestContextTTL {
+		contextsEvicted++
 		return nil, false
 	}
-
-	return ctx, true
+	return entry.ctx, true
 }
 
 // String returns a human-readable representation of the RequestContext,
 // useful for logging and debugging.
 func (rc *RequestContext) String() string {
-	return fmt.Sprintf("RequestContext{Method: %s, Path: %s, Claims: %d, Headers: %d}",
-		rc.Method, rc.Path, len(rc.JWTClaims), len(rc.Headers))
+	return fmt.Sprintf("RequestContext{Method: %s, Path: %s, Claims: %d}",
+		rc.Method, rc.Path, len(rc.JWTClaims))
 }

@@ -598,8 +598,7 @@ func TestConsentFilter_ResponseFilter_ContextCleanup(t *testing.T) {
 	resp := newMockResponse(id, []byte(`{}`))
 	(&ConsentFilter{}).ResponseFilter(cfg, resp)
 
-	_, found := LoadRequestContext(testReqKey(id))
-	assert.False(t, found, "request context should be deleted after ResponseFilter")
+	assert.Equal(t, 0, RequestContextStoreSize(), "request context should be deleted after ResponseFilter")
 }
 
 func TestConsentFilter_ResponseFilter_DenySetsContentType(t *testing.T) {

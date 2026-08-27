@@ -505,8 +505,8 @@ func TestIntegration_ContextCleanupAfterCycle(t *testing.T) {
 	_ = runPluginCycle(t, marshalConfig(t, baseConfig(srv.URL, resolver.URL+"/resolve")),
 		consentRequest(id, "did:key:zCaller"), []byte(`{"data":"test"}`))
 
-	_, found := plugin.LoadRequestContext(integrationReqKey(id))
-	assert.False(t, found, "request context should be deleted after the response cycle")
+	assert.Equal(t, 0, plugin.RequestContextStoreSize(),
+		"request context should be deleted after the response cycle")
 }
 
 // newConsentManagerCC starts a mock consent-manager exposing all four endpoints

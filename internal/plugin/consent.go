@@ -105,17 +105,13 @@ func (c *ConsentFilter) RequestFilter(conf interface{}, w http.ResponseWriter, r
 	}
 
 	reqCtx := &RequestContext{
-		Method:  r.Method(),
-		Path:    string(r.Path()),
-		Headers: make(http.Header),
+		Method: r.Method(),
+		Path:   string(r.Path()),
 	}
 
-	// Capture request headers from the request's Header view.
-	if srcHeaders := r.Header().View(); srcHeaders != nil {
-		for key, values := range srcHeaders {
-			reqCtx.Headers[key] = values
-		}
-	}
+	// Only the configured JWT header is read, and only the claims are kept. The
+	// full header set is deliberately not retained: it would put the caller's
+	// bearer token in a process-lifetime map that nothing ever reads.
 
 	// Extract JWT token and decode claims from the configured header.
 	jwtHeaderValue := r.Header().Get(cfg.JWTHeaderName)
