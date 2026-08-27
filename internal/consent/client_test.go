@@ -843,3 +843,90 @@ func TestCheckConsent_PurposeScoped(t *testing.T) {
 		})
 	}
 }
+
+// TestFetchProviderSD_Failures covers the derivation of the provider
+// self-description from /participants/me. It runs before any consent check, so
+// a failure here takes the whole exchange down (fail-closed) — the branches are
+// worth pinning.
+func TestFetchProviderSD_Failures(t *testing.T) {
+	tests := []struct {
+		name       string
+		status     int
+		body       string
+		wantErr    string
+		wantNoBody bool
+	}{
+		{
+			name:   "a 401 is reported as unauthorized so the caller can refresh",
+			status: http.StatusUnauthorized,
+			body:   `{}`,
+			// CheckConsent maps the retried-and-still-401 case to this message.
+			wantErr: "participant token rejected (401)",
+		},
+		{
+			name:    "a 500 is classified without its body",
+			status:  http.StatusInternalServerError,
+			body:    `{"error":"boom for alice@example.org"}`,
+			wantErr: "participant lookup (/me) returned status 500",
+		},
+		{
+			name:    "an unparseable body errors",
+			status:  http.StatusOK,
+			body:    `not json`,
+			wantErr: "failed to unmarshal /me response",
+		},
+		{
+			name:    "an empty selfDescriptionURL errors",
+			status:  http.StatusOK,
+			body:    `{"selfDescriptionURL":""}`,
+			wantErr: "/me returned no selfDescriptionURL",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resetCredCache()
+
+			mux := http.NewServeMux()
+			mux.HandleFunc("/v1/participants/me", func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(tt.status)
+				_, _ = w.Write([]byte(tt.body))
+			})
+			mux.HandleFunc(tokenServicePath, func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(map[string]interface{}{
+					"access_token": "tok", "token_type": "Bearer", "expires_in": 3600,
+				})
+			})
+			srv := httptest.NewServer(mux)
+			t.Cleanup(srv.Close)
+
+			c := NewClient(ClientConfig{BaseURL: srv.URL, ConsentKey: "ck", TokenServiceURL: srv.URL + tokenServicePath, TokenAudience: testAudience})
+
+			_, err := c.CheckConsent(context.Background(), ConsentRequest{Subject: "did:key:z", Consumer: testConsumerSD})
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tt.wantErr)
+			assert.NotContains(t, err.Error(), "alice@example.org",
+				"a dependency response body must not travel in the error")
+		})
+	}
+}
+
+// TestProviderSelfDescription_StaticOverride verifies a configured provider SD
+// is returned without any HTTP call at all.
+func TestProviderSelfDescription_StaticOverride(t *testing.T) {
+	resetCredCache()
+	m := &mockCM{userID: "uid-1", statuses: []string{"granted"}}
+	srv := newMockCM(t, m)
+	c := NewClient(ClientConfig{BaseURL: srv.URL, ParticipantToken: "static", ProviderSD: "http://catalog/participants/static"})
+
+	sd, err := c.ProviderSelfDescription(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, "http://catalog/participants/static", sd)
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	assert.Equal(t, 0, m.meCalls, "a static provider SD must not trigger /me")
+	assert.Equal(t, 0, m.tokenCalls, "a static token must not trigger the token service")
+}

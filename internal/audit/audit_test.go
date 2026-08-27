@@ -252,3 +252,25 @@ func TestDroppedIsObservable(t *testing.T) {
 
 	assert.Equal(t, uint64(4), e.Dropped(), "one event fits the queue, the rest are dropped and counted")
 }
+
+// TestDroppedAggregatesAcrossEmitters verifies the package-level Dropped — the
+// value the registered metric callback reads, and therefore the only thing that
+// makes suppression of an access record visible — sums every emitter.
+func TestDroppedAggregatesAcrossEmitters(t *testing.T) {
+	ShutdownAll() // start from a clean registry
+	t.Cleanup(ShutdownAll)
+
+	assert.Zero(t, Dropped(), "a fresh registry has dropped nothing")
+
+	// Two emitters whose workers are already stopped, so nothing drains them.
+	for _, serviceName := range []string{"audit-a", "audit-b"} {
+		e := Get(Config{Endpoint: "http://collector.invalid:4318", ServiceName: serviceName})
+		e.Shutdown()
+		for i := 0; i < defaultQueueSize+3; i++ {
+			e.Emit(Event{Time: time.Now(), Decision: "allow"})
+		}
+	}
+
+	assert.Equal(t, uint64(6), Dropped(),
+		"three events past the queue size are dropped by each of the two emitters")
+}
