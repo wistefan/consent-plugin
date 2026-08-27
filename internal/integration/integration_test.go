@@ -22,6 +22,7 @@
 package integration
 
 import (
+	"consent-plugin/internal/consent"
 	"consent-plugin/internal/plugin"
 	"context"
 	"encoding/base64"
@@ -32,6 +33,8 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strconv"
+	"strings"
+	"sync"
 	"testing"
 
 	pkgHTTP "github.com/apache/apisix-go-plugin-runner/pkg/http"
@@ -248,6 +251,45 @@ func newFailingConsentManager(status int) *httptest.Server {
 		w.WriteHeader(status)
 	})
 	return httptest.NewServer(mux)
+}
+
+// resolveEnvelope is the /resolve request the plugin sends, decoded so tests can
+// assert on what the resolver was actually told.
+type resolveEnvelope struct {
+	Resource struct {
+		Service     string `json:"service"`
+		Method      string `json:"method"`
+		Path        string `json:"path"`
+		ContentType string `json:"contentType"`
+	} `json:"resource"`
+	Parties *struct {
+		Consumer string `json:"consumer"`
+		Provider string `json:"provider"`
+	} `json:"parties"`
+	Body *struct {
+		Encoding string          `json:"encoding"`
+		Content  json.RawMessage `json:"content"`
+	} `json:"body"`
+}
+
+// newRecordingOwnerResolver starts a mock OwnerResolver that answers with the
+// given JSON and records every envelope it received.
+func newRecordingOwnerResolver(t *testing.T, reply map[string]interface{}, received *[]resolveEnvelope) *httptest.Server {
+	t.Helper()
+	var mu sync.Mutex
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var env resolveEnvelope
+		if err := json.NewDecoder(r.Body).Decode(&env); err != nil {
+			t.Errorf("failed to decode resolve request: %v", err)
+		}
+		mu.Lock()
+		*received = append(*received, env)
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(reply); err != nil {
+			t.Errorf("failed to encode resolve response: %v", err)
+		}
+	}))
 }
 
 // newOwnerResolver starts a mock OwnerResolver that reports the given data
@@ -603,3 +645,246 @@ func TestIntegration_TokenServiceDenied(t *testing.T) {
 	assert.Equal(t, 403, resp.writtenStatus)
 	assert.Equal(t, defaultDenyBody, string(resp.writtenBody))
 }
+
+// --- Resolver-mode integration tests ---
+
+// perOwnerConsentManager starts a consent-manager whose consent status is looked
+// up per data owner, so a multi-owner response can mix granted and revoked
+// owners. It records the owners it was asked about, in order.
+func perOwnerConsentManager(t *testing.T, statusByOwner map[string]string, asked *[]string) *httptest.Server {
+	t.Helper()
+	var mu sync.Mutex
+	identifiers := map[string]string{}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/users/identifier/search", func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]string
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		owner := body["email"]
+		mu.Lock()
+		*asked = append(*asked, owner)
+		status, known := statusByOwner[owner]
+		if known {
+			identifiers["uid-"+owner] = status
+		}
+		mu.Unlock()
+		if !known {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{"userIdentifier": "uid-" + owner})
+	})
+	mux.HandleFunc("/v1/consents/participants/", func(w http.ResponseWriter, r *http.Request) {
+		id := strings.TrimPrefix(r.URL.Path, "/v1/consents/participants/")
+		mu.Lock()
+		status := identifiers[id]
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"consents": consentsGrantedTo([]string{status})})
+	})
+	mux.HandleFunc("/v1/participants", participantRegistryHandler)
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// TestIntegration_Resolver drives the resolver-mode decision matrix end to end:
+// a real ParseConf -> RequestFilter -> ResponseFilter against a mock resolver
+// and a mock consent-manager.
+func TestIntegration_Resolver(t *testing.T) {
+	const (
+		ownerAlice = "did:key:zAlice"
+		ownerBob   = "did:key:zBob"
+	)
+
+	tests := []struct {
+		name          string
+		resolverReply map[string]interface{}
+		resolverCode  int // non-zero => the resolver answers with this status instead
+		statusByOwner map[string]string
+		failOpen      *bool
+		wantDenied    bool
+		wantOwners    []string // owners the consent-manager must have been asked about
+	}{
+		{
+			name:          "every owner granted allows",
+			resolverReply: resolveReply(ownerAlice, ownerBob),
+			statusByOwner: map[string]string{ownerAlice: "granted", ownerBob: "granted"},
+			wantOwners:    []string{ownerAlice, ownerBob},
+		},
+		{
+			name:          "one revoked owner denies the whole response (deny_all)",
+			resolverReply: resolveReply(ownerAlice, ownerBob),
+			statusByOwner: map[string]string{ownerAlice: "granted", ownerBob: "revoked"},
+			wantDenied:    true,
+			wantOwners:    []string{ownerAlice, ownerBob},
+		},
+		{
+			name:          "an owner unknown to the consent-manager denies",
+			resolverReply: resolveReply(ownerAlice, ownerBob),
+			statusByOwner: map[string]string{ownerAlice: "granted"},
+			wantDenied:    true,
+		},
+		{
+			name:          "consentRequired false allows without any consent call",
+			resolverReply: map[string]interface{}{"consentRequired": false},
+			wantOwners:    nil,
+		},
+		{
+			name:          "consent required with no claims denies",
+			resolverReply: map[string]interface{}{"consentRequired": true, "claims": []map[string]string{}},
+			wantDenied:    true,
+			wantOwners:    nil,
+		},
+		{
+			name: "a claim with an empty owner denies",
+			resolverReply: map[string]interface{}{
+				"consentRequired": true,
+				"claims":          []map[string]string{{"ownerId": ""}},
+			},
+			wantDenied: true,
+			wantOwners: nil,
+		},
+		{
+			name:         "resolver 5xx denies by default",
+			resolverCode: http.StatusInternalServerError,
+			wantDenied:   true,
+			wantOwners:   nil,
+		},
+		{
+			name:         "resolver 5xx passes through with fail_open",
+			resolverCode: http.StatusInternalServerError,
+			failOpen:     boolPtr(true),
+			wantOwners:   nil,
+		},
+		{
+			name:          "duplicate owners are checked once",
+			resolverReply: resolveReply(ownerAlice, ownerAlice, ownerAlice),
+			statusByOwner: map[string]string{ownerAlice: "granted"},
+			wantOwners:    []string{ownerAlice},
+		},
+	}
+
+	// Each case needs its own request id, so the context store entries cannot
+	// collide between subtests.
+	nextRequestID := uint32(100)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			consent.ResetCaches()
+			nextRequestID++
+
+			var asked []string
+			cm := perOwnerConsentManager(t, tt.statusByOwner, &asked)
+
+			var resolver *httptest.Server
+			if tt.resolverCode != 0 {
+				resolver = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+					w.WriteHeader(tt.resolverCode)
+				}))
+			} else {
+				var received []resolveEnvelope
+				resolver = newRecordingOwnerResolver(t, tt.resolverReply, &received)
+			}
+			defer resolver.Close()
+
+			cfg := baseConfig(cm.URL, resolver.URL+"/resolve")
+			if tt.failOpen != nil {
+				cfg["fail_open"] = *tt.failOpen
+			}
+
+			resp := runPluginCycle(t, marshalConfig(t, cfg),
+				consentRequest(nextRequestID, "did:key:zCaller"), []byte(`{"id":"urn:entity:1"}`))
+
+			if tt.wantDenied {
+				assert.Equal(t, 403, resp.writtenStatus)
+				assert.Equal(t, defaultDenyBody, string(resp.writtenBody))
+			} else {
+				assert.Nil(t, resp.writtenBody, "expected the response to pass through")
+				assert.Equal(t, 0, resp.writtenStatus)
+			}
+			if tt.wantOwners != nil {
+				assert.Equal(t, tt.wantOwners, asked, "the consent-manager must be asked about exactly these owners")
+			}
+		})
+	}
+}
+
+// resolveReply builds a /resolve reply requiring consent from the given owners.
+func resolveReply(owners ...string) map[string]interface{} {
+	claims := make([]map[string]string, 0, len(owners))
+	for _, o := range owners {
+		claims = append(claims, map[string]string{"ownerId": o})
+	}
+	return map[string]interface{}{"consentRequired": true, "claims": claims}
+}
+
+// TestIntegration_ResolverReceivesPartiesAndPayload verifies what the plugin
+// actually tells the resolver: the resource descriptor, the contract parties
+// (resolved via the participant registry), and the upstream payload as JSON.
+func TestIntegration_ResolverReceivesPartiesAndPayload(t *testing.T) {
+	consent.ResetCaches()
+
+	var asked []string
+	cm := perOwnerConsentManager(t, map[string]string{"did:key:zAlice": "granted"}, &asked)
+
+	var received []resolveEnvelope
+	resolver := newRecordingOwnerResolver(t, resolveReply("did:key:zAlice"), &received)
+	defer resolver.Close()
+
+	cfg := baseConfig(cm.URL, resolver.URL+"/resolve")
+	cfg["service"] = "personal-profiles"
+
+	payload := []byte(`{"id":"urn:ngsi-ld:PersonalProfile:alice"}`)
+	runPluginCycle(t, marshalConfig(t, cfg), consentRequest(150, "did:key:zCaller"), payload)
+
+	require.Len(t, received, 1)
+	env := received[0]
+	assert.Equal(t, "personal-profiles", env.Resource.Service)
+	assert.Equal(t, "GET", env.Resource.Method)
+	assert.Equal(t, "/ngsi-ld/v1/entities/urn:ngsi-ld:PersonalProfile:alice", env.Resource.Path)
+	require.NotNil(t, env.Parties, "the contract parties must be sent, or the resolver cannot identify the contract")
+	assert.Equal(t, itestConsumerSD, env.Parties.Consumer, "the consumer DID must be mapped to its self-description")
+	assert.Equal(t, "http://consent-facade:8080/participants/org-itest", env.Parties.Provider)
+	require.NotNil(t, env.Body)
+	assert.Equal(t, "json", env.Body.Encoding)
+	assert.JSONEq(t, string(payload), string(env.Body.Content))
+}
+
+// TestIntegration_PartyResolutionFailureDenies verifies the fail-closed seam
+// from H-1 end to end: when the consumer cannot be mapped to a participant, the
+// resolver is never asked and the response is denied — even with fail_open,
+// which must not turn a token naming an unregistered consumer into a bypass.
+func TestIntegration_PartyResolutionFailureDenies(t *testing.T) {
+	consent.ResetCaches()
+
+	var asked []string
+	cm := perOwnerConsentManager(t, map[string]string{}, &asked)
+
+	resolverCalled := false
+	resolver := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		resolverCalled = true
+		w.Header().Set("Content-Type", "application/json")
+		// An unidentified-party resolve could plausibly answer "no contract
+		// governs this, so no consent is required" — an unconditional allow.
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"consentRequired": false})
+	}))
+	defer resolver.Close()
+
+	h := newMockRequestHeader()
+	h.Set("Authorization", "Bearer "+buildMockJWT(map[string]interface{}{
+		"verifiableCredential": map[string]interface{}{"issuer": "did:key:zUnregisteredConsumer"},
+	}))
+	req := &mockRequest{id: 160, method: "GET", path: []byte("/data"), header: h}
+
+	cfg := baseConfig(cm.URL, resolver.URL+"/resolve")
+	cfg["fail_open"] = true
+
+	resp := runPluginCycle(t, marshalConfig(t, cfg), req, []byte(`{"a":1}`))
+
+	assert.False(t, resolverCalled, "an unidentified consumer must not reach the resolver")
+	assert.Equal(t, 403, resp.writtenStatus, "an unidentified consumer must deny")
+}
+
+// boolPtr returns a pointer to b, for the optional fail_open flag.
+func boolPtr(b bool) *bool { return &b }

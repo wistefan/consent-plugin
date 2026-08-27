@@ -169,21 +169,8 @@ func newMockCM(t *testing.T, m *mockCM) *httptest.Server {
 	return srv
 }
 
-// resetCredCache clears the package-wide credential cache between tests.
-func resetCredCache() {
-	credCacheMu.Lock()
-	credCache = map[string]*cacheEntry{}
-	credCacheMu.Unlock()
-	resetParticipantSDCache()
-}
-
-// resetParticipantSDCache clears the package-wide DID -> self-description cache
-// between tests, so a positive or negative result cannot leak across them.
-func resetParticipantSDCache() {
-	participantSDMu.Lock()
-	participantSDCache = map[string]participantSDEntry{}
-	participantSDMu.Unlock()
-}
+// resetCredCache clears the package-wide caches between tests.
+func resetCredCache() { ResetCaches() }
 
 // TestCheckConsent_HostOverride verifies the configured Host header is sent to
 // the consent-manager (for host-scoped gateway routes) while the connection
@@ -730,4 +717,50 @@ func TestParticipantSelfDescriptionByDID_NegativeCaching(t *testing.T) {
 		assert.Contains(t, err.Error(), "no participant registered")
 	}
 	assert.Equal(t, 1, registryCalls, "an unknown DID must be remembered, not re-fetched per request")
+}
+
+// TestDecodeParticipants verifies both registry shapes are accepted: the
+// consent-manager has returned a bare array and a wrapped list at different
+// times, and a plugin that understands only one silently loses the ability to
+// identify the consumer.
+func TestDecodeParticipants(t *testing.T) {
+	tests := []struct {
+		name    string
+		body    string
+		want    []participantListEntry
+		wantErr bool
+	}{
+		{
+			name: "bare array",
+			body: `[{"did":"did:key:zA","selfDescriptionURL":"http://catalog/a"}]`,
+			want: []participantListEntry{{DID: "did:key:zA", SelfDescriptionURL: "http://catalog/a"}},
+		},
+		{
+			name: "wrapped list",
+			body: `{"participants":[{"did":"did:key:zB","selfDescriptionURL":"http://catalog/b"}]}`,
+			want: []participantListEntry{{DID: "did:key:zB", SelfDescriptionURL: "http://catalog/b"}},
+		},
+		{
+			name: "empty array",
+			body: `[]`,
+			want: []participantListEntry{},
+		},
+		{
+			name:    "not JSON at all",
+			body:    `<html>gateway error</html>`,
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := decodeParticipants([]byte(tt.body))
+			if tt.wantErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, got)
+		})
+	}
 }

@@ -436,3 +436,69 @@ func TestConsentFilter_ParseConf_Integration(t *testing.T) {
 		assert.Nil(t, conf)
 	})
 }
+
+func TestConfig_IsFailOpen(t *testing.T) {
+	tests := []struct {
+		name     string
+		failOpen *bool
+		want     bool
+	}{
+		{name: "nil defaults to false (fail-closed)", failOpen: nil, want: false},
+		{name: "explicitly true is fail-open", failOpen: boolPtr(true), want: true},
+		{name: "explicitly false is fail-closed", failOpen: boolPtr(false), want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &Config{FailOpen: tt.failOpen}
+			assert.Equal(t, tt.want, cfg.IsFailOpen())
+		})
+	}
+}
+
+// TestClaimKeysToDecode verifies which claims the request phase decodes: the
+// configured forward list plus the root of the consumer-claim path, so the
+// consuming participant can still be read in the response phase.
+func TestClaimKeysToDecode(t *testing.T) {
+	tests := []struct {
+		name     string
+		forward  []string
+		consumer string
+		want     []string
+	}{
+		{
+			name: "empty forward list decodes every claim",
+			want: nil,
+		},
+		{
+			name:     "the consumer-claim root is added to the forward list",
+			forward:  []string{"sub"},
+			consumer: "verifiableCredential.issuer",
+			want:     []string{"sub", "verifiableCredential"},
+		},
+		{
+			name:     "an already-listed root is not added twice",
+			forward:  []string{"sub", "verifiableCredential"},
+			consumer: "verifiableCredential.issuer",
+			want:     []string{"sub", "verifiableCredential"},
+		},
+		{
+			name:     "a single-segment consumer claim is its own root",
+			forward:  []string{"sub"},
+			consumer: "issuer",
+			want:     []string{"sub", "issuer"},
+		},
+		{
+			name:    "no consumer claim leaves the forward list alone",
+			forward: []string{"sub"},
+			want:    []string{"sub"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := claimKeysToDecode(&Config{JWTClaimsToForward: tt.forward, ConsumerClaim: tt.consumer})
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}

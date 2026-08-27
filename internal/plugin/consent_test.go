@@ -704,22 +704,3 @@ func TestResponseFilter_OwnerNotRequestor(t *testing.T) {
 	assert.Equal(t, DefaultDenyStatusCode, resp.writtenStatus,
 		"the owner has no granted consent, so the caller's own consent must not unlock the data")
 }
-
-func TestConfig_IsFailOpen(t *testing.T) {
-	tests := []struct {
-		name     string
-		failOpen *bool
-		want     bool
-	}{
-		{name: "nil defaults to false (fail-closed)", failOpen: nil, want: false},
-		{name: "explicitly true is fail-open", failOpen: boolPtr(true), want: true},
-		{name: "explicitly false is fail-closed", failOpen: boolPtr(false), want: false},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			cfg := &Config{FailOpen: tt.failOpen}
-			assert.Equal(t, tt.want, cfg.IsFailOpen())
-		})
-	}
-}
