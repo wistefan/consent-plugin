@@ -154,8 +154,10 @@ func (r *mockResponse) Var(name string) ([]byte, error) {
 }
 func (r *mockResponse) ReadBody() ([]byte, error)  { return r.body, nil }
 func (r *mockResponse) WriteHeader(statusCode int) { r.writtenStatus = statusCode }
+
+// Write appends, as the runner's Response.Write does (it writes into a buffer).
 func (r *mockResponse) Write(b []byte) (int, error) {
-	r.writtenBody = b
+	r.writtenBody = append(r.writtenBody, b...)
 	return len(b), nil
 }
 

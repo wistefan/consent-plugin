@@ -89,24 +89,21 @@ func TestPluginName_Constant(t *testing.T) {
 // --- Mock implementations for testing ResponseFilter ---
 
 // mockHeader implements pkgHTTP.Header for testing.
+// mockHeader mirrors the runner's header implementation: View() returns the LIVE
+// header map (not a copy), so a caller iterating it and deleting through Del
+// behaves exactly as it does in production.
 type mockHeader struct {
-	headers map[string]string
+	headers http.Header
 }
 
 func newMockHeader() *mockHeader {
-	return &mockHeader{headers: make(map[string]string)}
+	return &mockHeader{headers: make(http.Header)}
 }
 
-func (h *mockHeader) Set(key, value string) { h.headers[http.CanonicalHeaderKey(key)] = value }
-func (h *mockHeader) Del(key string)        { delete(h.headers, http.CanonicalHeaderKey(key)) }
-func (h *mockHeader) Get(key string) string { return h.headers[http.CanonicalHeaderKey(key)] }
-func (h *mockHeader) View() http.Header {
-	result := make(http.Header)
-	for k, v := range h.headers {
-		result[k] = []string{v}
-	}
-	return result
-}
+func (h *mockHeader) Set(key, value string) { h.headers.Set(key, value) }
+func (h *mockHeader) Del(key string)        { h.headers.Del(key) }
+func (h *mockHeader) Get(key string) string { return h.headers.Get(key) }
+func (h *mockHeader) View() http.Header     { return h.headers }
 
 // mockResponse implements pkgHTTP.Response for testing.
 type mockResponse struct {
@@ -140,8 +137,11 @@ func (r *mockResponse) Var(name string) ([]byte, error) {
 }
 
 func (r *mockResponse) ReadBody() ([]byte, error) { return r.body, r.readErr }
+
+// Write appends, as the runner's Response.Write does (it writes into a buffer).
+// A mock that replaced the body would hide a double-write regression.
 func (r *mockResponse) Write(b []byte) (int, error) {
-	r.writtenBody = b
+	r.writtenBody = append(r.writtenBody, b...)
 	return len(b), nil
 }
 func (r *mockResponse) WriteHeader(statusCode int) { r.writtenStatus = statusCode }
@@ -824,4 +824,45 @@ func TestDistinctClaims(t *testing.T) {
 			assert.Equal(t, tt.want, got)
 		})
 	}
+}
+
+// TestDenyResponse_StripsUpstreamHeaders verifies the denial does not inherit the
+// upstream's headers. A denied caller must not be told that the entity exists
+// (ETag/Last-Modified), how many records matched (X-Total-Count), that more
+// pages follow (Link), or be handed a session cookie — that is a side channel
+// straight around the gate. Content-Length must also describe the deny body, not
+// the upstream's.
+func TestDenyResponse_StripsUpstreamHeaders(t *testing.T) {
+	clearContextStore()
+	server := newConsentManager(t, "uid-1", []string{"revoked"})
+	defer server.Close()
+	resolver := newOwnerResolver(t, ownedBy(testOwnerDID))
+	defer resolver.Close()
+
+	const id = uint32(220)
+	storeRequest(id)
+
+	resp := newMockResponse(id, []byte(`{"records":[1,2,3]}`))
+	resp.header.Set("ETag", `"v7"`)
+	resp.header.Set("Last-Modified", "Wed, 27 Aug 2026 10:00:00 GMT")
+	resp.header.Set("Set-Cookie", "session=abc123")
+	resp.header.Set("Link", `</items?page=2>; rel="next"`)
+	resp.header.Set("X-Total-Count", "4210")
+	resp.header.Set("NGSILD-Results-Count", "4210")
+	resp.header.Set("Content-Encoding", "gzip")
+	resp.header.Set("Content-Length", "19")
+	resp.header.Set("Access-Control-Allow-Origin", "https://app.example.org")
+
+	(&ConsentFilter{}).ResponseFilter(newTestConfig(server.URL, resolver.URL+"/resolve"), resp)
+
+	require.Equal(t, DefaultDenyStatusCode, resp.writtenStatus)
+	for _, leaked := range []string{"ETag", "Last-Modified", "Set-Cookie", "Link", "X-Total-Count", "NGSILD-Results-Count", "Content-Encoding"} {
+		assert.Empty(t, resp.header.Get(leaked), "%s must not survive a denial", leaked)
+	}
+	assert.Equal(t, "https://app.example.org", resp.header.Get("Access-Control-Allow-Origin"),
+		"CORS headers describe the exchange, not the data, and must survive so the client sees the 403")
+	assert.Equal(t, DefaultDenyResponseContentType, resp.header.Get("Content-Type"))
+	assert.Equal(t, strconv.Itoa(len(DefaultDenyResponseBody)), resp.header.Get("Content-Length"),
+		"Content-Length must describe the deny body, not the upstream's")
+	assert.Equal(t, DefaultDenyResponseBody, string(resp.writtenBody))
 }

@@ -29,6 +29,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -534,14 +535,56 @@ func recordAudit(cfg *Config, outcome responseOutcome) {
 	})
 }
 
-// denyResponse writes a denial response to the client using the configured
-// status code, body, and content type.
+// deniedResponseHeaderPrefixes are the only upstream response headers allowed to
+// survive a denial. CORS headers describe the exchange rather than the resource,
+// and dropping them would show a browser client a CORS error instead of the 403
+// it was actually given.
+var deniedResponseHeaderPrefixes = []string{"Access-Control-"}
+
+// denyResponse replaces the upstream response with the configured denial.
+//
+// Every other upstream header is removed first. A denied caller must not learn
+// anything about the data they were refused, and the upstream's headers say
+// plenty: Set-Cookie, ETag and Last-Modified (the entity exists, and this is its
+// version), Link (there are more pages), and application counters such as
+// X-Total-Count or NGSILD-Results-Count (how many records matched) — a side
+// channel straight around the gate. Content-Encoding and the upstream's
+// Content-Length are also actively wrong once the body is replaced, so
+// Content-Length is set to the deny body's own size.
 func denyResponse(w pkgHTTP.Response, cfg *Config) {
-	w.Header().Set("Content-Type", cfg.DenyResponseContentType)
+	body := []byte(cfg.DenyResponseBody)
+
+	header := w.Header()
+	if view := header.View(); view != nil {
+		// Collect first: the names are read from the same map Del mutates.
+		names := make([]string, 0, len(view))
+		for name := range view {
+			names = append(names, name)
+		}
+		for _, name := range names {
+			if !survivesDenial(name) {
+				header.Del(name)
+			}
+		}
+	}
+	header.Set("Content-Type", cfg.DenyResponseContentType)
+	header.Set("Content-Length", strconv.Itoa(len(body)))
+
 	w.WriteHeader(cfg.DenyStatusCode)
-	if _, err := w.Write([]byte(cfg.DenyResponseBody)); err != nil {
+	if _, err := w.Write(body); err != nil {
 		log.Printf("[consent-filter] ResponseFilter: failed to write deny body for request %d: %v", w.ID(), err)
 	}
+}
+
+// survivesDenial reports whether an upstream response header may be kept on a
+// denial.
+func survivesDenial(name string) bool {
+	for _, prefix := range deniedResponseHeaderPrefixes {
+		if strings.HasPrefix(http.CanonicalHeaderKey(name), prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 // claimKeysToDecode returns the claim keys the request phase must decode: the
