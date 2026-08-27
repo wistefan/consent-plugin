@@ -1,3 +1,20 @@
+/*
+ * Copyright 2026 Seamless Middleware Technologies S.L and/or its affiliates
+ * and other contributors as indicated by the @author tags.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 package consent
 
 import (
@@ -28,11 +45,13 @@ const (
 	// the participant. Authenticated with the participant JWT. %s = identifier.
 	participantConsentsPathFmt = "/consents/participants/%s"
 
-	// participantLoginPath exchanges client credentials for a participant JWT.
-	participantLoginPath = "/participants/login"
-
 	// participantMePath returns the calling participant (incl. selfDescriptionURL).
 	participantMePath = "/participants/me"
+
+	// participantsPath lists the known participants (the consent-manager is the
+	// participant registry), used to map a participant DID to its
+	// self-description URL.
+	participantsPath = "/participants"
 
 	// consentKeyHeader carries the shared consent key on the identifier search.
 	consentKeyHeader = "x-visionstrust-consent-key"
@@ -51,6 +70,10 @@ const (
 	// tokens, so the default keeps a safety margin.
 	DefaultTokenTTL = 50 * time.Minute
 
+	// tokenRefreshSkew is subtracted from a token's cached lifetime so it is never
+	// presented in the last moments before it expires.
+	tokenRefreshSkew = 60 * time.Second
+
 	// ContentTypeJSON is the Content-Type used for JSON request bodies.
 	ContentTypeJSON = "application/json"
 )
@@ -64,21 +87,25 @@ var errParticipantUnauthorized = errors.New("consent client: participant token u
 type ClientConfig struct {
 	// BaseURL is the consent-manager root (e.g. "http://consent-manager:3000").
 	BaseURL string
+	// Host, if set, overrides the HTTP Host header on every request (the URL host
+	// is still used for the connection). Needed for host-scoped gateway routes.
+	Host string
 	// APIPrefix is prepended to endpoint paths (defaults to DefaultAPIPrefix).
 	APIPrefix string
 	// ConsentKey is the shared secret sent on the identifier search (required).
 	ConsentKey string
 	// ProviderSD, if empty, is derived from GET /participants/me after login.
 	ProviderSD string
-	// ParticipantToken, if set, is used as a static token (no login is done).
-	// Otherwise ClientID/ClientSecret are exchanged for a token.
+	// ParticipantToken, if set, is used as a static token (nothing is fetched).
+	// Otherwise a token is obtained from TokenServiceURL.
 	ParticipantToken string
-	// ClientID / ClientSecret are the participant client credentials used to
-	// obtain (and refresh) a participant token via /participants/login.
-	ClientID     string
-	ClientSecret string
-	// TokenTTL is how long a client-credentials token is cached (defaults to
-	// DefaultTokenTTL).
+	// TokenServiceURL is the participant-local OID4VP token service that mints an
+	// access token for this participant (the consent-facade's /internal/tokens).
+	TokenServiceURL string
+	// TokenAudience is the audience name asked of the token service.
+	TokenAudience string
+	// TokenTTL caps how long a fetched token is cached (defaults to
+	// DefaultTokenTTL); the token service's own expiry wins when shorter.
 	TokenTTL time.Duration
 	// TimeoutMs is the per-call HTTP timeout (defaults to DefaultTimeoutMs).
 	TimeoutMs int
@@ -93,21 +120,24 @@ type ClientConfig struct {
 //  2. GET  {base}/consents/participants/{id}?receipt=true — list that user's
 //     consents, authenticated with the participant JWT.
 //
-// The participant JWT and (optionally) the provider self-description are obtained
-// via client credentials: POST /participants/login exchanges ClientID/ClientSecret
-// for a token, and GET /participants/me yields the provider selfDescriptionURL.
-// Tokens are cached package-wide (keyed by base URL + client id) and refreshed on
-// expiry or a 401. Access is allowed iff a returned consent is "granted".
+// The access token is obtained from the participant-local OID4VP token service
+// (POST {TokenServiceURL} with the configured audience), so this plugin holds no
+// participant credentials of its own: the token service presents the
+// participant's verifiable credential and returns a short-lived token. GET
+// /participants/me then yields the provider selfDescriptionURL. Tokens are cached
+// package-wide (keyed by base URL + audience) and refreshed on expiry or a 401.
+// Access is allowed iff a returned consent is "granted".
 type Client struct {
-	baseURL      string
-	apiPrefix    string
-	consentKey   string
-	providerSD   string
-	staticToken  string
-	clientID     string
-	clientSecret string
-	tokenTTL     time.Duration
-	httpClient   *http.Client
+	baseURL         string
+	host            string
+	apiPrefix       string
+	consentKey      string
+	providerSD      string
+	staticToken     string
+	tokenServiceURL string
+	tokenAudience   string
+	tokenTTL        time.Duration
+	httpClient      *http.Client
 }
 
 // NewClient creates a consent-manager client from cfg, applying defaults for
@@ -126,15 +156,16 @@ func NewClient(cfg ClientConfig) *Client {
 		ttl = DefaultTokenTTL
 	}
 	return &Client{
-		baseURL:      cfg.BaseURL,
-		apiPrefix:    prefix,
-		consentKey:   cfg.ConsentKey,
-		providerSD:   cfg.ProviderSD,
-		staticToken:  cfg.ParticipantToken,
-		clientID:     cfg.ClientID,
-		clientSecret: cfg.ClientSecret,
-		tokenTTL:     ttl,
-		httpClient:   &http.Client{Timeout: time.Duration(timeout) * time.Millisecond},
+		baseURL:         cfg.BaseURL,
+		host:            cfg.Host,
+		apiPrefix:       prefix,
+		consentKey:      cfg.ConsentKey,
+		providerSD:      cfg.ProviderSD,
+		staticToken:     cfg.ParticipantToken,
+		tokenServiceURL: cfg.TokenServiceURL,
+		tokenAudience:   cfg.TokenAudience,
+		tokenTTL:        ttl,
+		httpClient:      &http.Client{Timeout: time.Duration(timeout) * time.Millisecond},
 	}
 }
 
@@ -156,7 +187,7 @@ var (
 	credCache   = map[string]*cacheEntry{}
 )
 
-func (c *Client) cacheKey() string { return c.baseURL + "|" + c.clientID }
+func (c *Client) cacheKey() string { return c.baseURL + "|" + c.tokenAudience }
 
 // CheckConsent runs the two-call consent verification for req.Subject, allowing
 // when a granted consent exists and denying otherwise. An unknown subject is a
@@ -168,10 +199,10 @@ func (c *Client) CheckConsent(ctx context.Context, req ConsentRequest) (*Consent
 		return &ConsentResponse{Decision: DecisionDeny, Reason: "no subject in request"}, nil
 	}
 
-	resp, err := c.check(ctx, req.Subject, false)
+	resp, err := c.check(ctx, req.Subject, req.DataResource, false)
 	if errors.Is(err, errParticipantUnauthorized) && c.staticToken == "" {
 		// The cached token was rejected — refresh it and retry once.
-		resp, err = c.check(ctx, req.Subject, true)
+		resp, err = c.check(ctx, req.Subject, req.DataResource, true)
 	}
 	if errors.Is(err, errParticipantUnauthorized) {
 		// Still unauthorized (or a static token was rejected): surface a plain error.
@@ -181,8 +212,9 @@ func (c *Client) CheckConsent(ctx context.Context, req ConsentRequest) (*Consent
 }
 
 // check performs one full verification attempt. forceLogin refreshes a cached
-// client-credentials token before use.
-func (c *Client) check(ctx context.Context, subject string, forceLogin bool) (*ConsentResponse, error) {
+// client-credentials token before use. When dataResource is non-empty the check
+// is scoped: a granted consent counts only if it covers that resource.
+func (c *Client) check(ctx context.Context, subject, dataResource string, forceLogin bool) (*ConsentResponse, error) {
 	token, providerSD, err := c.credentials(ctx, forceLogin)
 	if err != nil {
 		return nil, err
@@ -196,31 +228,34 @@ func (c *Client) check(ctx context.Context, subject string, forceLogin bool) (*C
 		return &ConsentResponse{Decision: DecisionDeny, Reason: "no user identifier for subject"}, nil
 	}
 
-	granted, err := c.hasGrantedConsent(ctx, token, userIdentifier)
+	granted, err := c.hasGrantedConsent(ctx, token, userIdentifier, dataResource)
 	if err != nil {
 		return nil, err
 	}
 	if granted {
 		return &ConsentResponse{Decision: DecisionAllow}, nil
 	}
+	if dataResource != "" {
+		return &ConsentResponse{Decision: DecisionDeny, Reason: "no granted consent for resource " + dataResource}, nil
+	}
 	return &ConsentResponse{Decision: DecisionDeny, Reason: "no granted consent"}, nil
 }
 
 // credentials resolves the participant token and provider self-description,
 // preferring static configuration and otherwise using the client-credentials
-// login (cached) and GET /participants/me. forceLogin bypasses a cached token.
+// the token service (cached) and GET /participants/me. forceFetch bypasses a cached token.
 //
 // The global map lock is held only long enough to get-or-create this key's cache
 // entry; the login/me HTTP calls run under the entry's own lock. So a refresh for
 // one participant never blocks cache hits (or refreshes) for another, and
-// concurrent first requests for the same participant coalesce onto one login.
-func (c *Client) credentials(ctx context.Context, forceLogin bool) (token, providerSD string, err error) {
+// concurrent first requests for the same participant coalesce onto one fetch.
+func (c *Client) credentials(ctx context.Context, forceFetch bool) (token, providerSD string, err error) {
 	// Fully static: no cache or HTTP needed.
 	if c.staticToken != "" && c.providerSD != "" {
 		return c.staticToken, c.providerSD, nil
 	}
-	if c.staticToken == "" && (c.clientID == "" || c.clientSecret == "") {
-		return "", "", fmt.Errorf("consent client: no participant_token and no client_id/client_secret configured")
+	if c.staticToken == "" && c.tokenServiceURL == "" {
+		return "", "", fmt.Errorf("consent client: no participant_token and no token_service_url configured")
 	}
 
 	// Get-or-create the per-key entry under the map lock (brief), then release it
@@ -241,16 +276,16 @@ func (c *Client) credentials(ctx context.Context, forceLogin bool) (token, provi
 	// Participant token: static override, or a cached/refreshed login token.
 	token = c.staticToken
 	if token == "" {
-		if forceLogin {
+		if forceFetch {
 			entry.token = ""
 		}
 		if entry.token == "" || time.Now().After(entry.tokenExpiry) {
-			jwt, lerr := c.login(ctx)
+			fetched, lifetime, lerr := c.fetchToken(ctx)
 			if lerr != nil {
 				return "", "", lerr
 			}
-			entry.token = jwt
-			entry.tokenExpiry = time.Now().Add(c.tokenTTL)
+			entry.token = fetched
+			entry.tokenExpiry = time.Now().Add(cacheFor(lifetime, c.tokenTTL))
 		}
 		token = entry.token
 	}
@@ -271,40 +306,184 @@ func (c *Client) credentials(ctx context.Context, forceLogin bool) (token, provi
 	return token, providerSD, nil
 }
 
-// loginResponse is the consent-manager response to POST /participants/login.
-type loginResponse struct {
-	Success bool   `json:"success"`
-	JWT     string `json:"jwt"`
+// participantSDCacheTTL bounds how long a DID -> self-description mapping is
+// reused. Participants change rarely, so a generous TTL keeps the registry call
+// off the request path.
+const participantSDCacheTTL = 10 * time.Minute
+
+type participantSDEntry struct {
+	selfDescriptionURL string
+	expiry             time.Time
 }
 
-// login exchanges the client credentials for a participant token.
-func (c *Client) login(ctx context.Context) (string, error) {
-	payload, err := json.Marshal(map[string]string{"clientID": c.clientID, "clientSecret": c.clientSecret})
-	if err != nil {
-		return "", fmt.Errorf("consent client: failed to marshal login request: %w", err)
+var (
+	participantSDMu    sync.Mutex
+	participantSDCache = map[string]participantSDEntry{}
+)
+
+// participantListEntry is the (subset of the) consent-manager participant record.
+type participantListEntry struct {
+	DID                string `json:"did"`
+	SelfDescriptionURL string `json:"selfDescriptionURL"`
+}
+
+// participantsResponse tolerates both a bare array and a wrapped list.
+type participantsResponse struct {
+	Participants []participantListEntry `json:"participants"`
+}
+
+// ParticipantSelfDescriptionByDID maps a participant DID to its self-description
+// URL using the consent-manager's participant registry. Contracts name their
+// parties by self-description URL, so a DID taken from a credential must be
+// translated before it can be used in a contract lookup. Results are cached for
+// participantSDCacheTTL.
+func (c *Client) ParticipantSelfDescriptionByDID(ctx context.Context, did string) (string, error) {
+	if did == "" {
+		return "", fmt.Errorf("consent client: empty participant did")
 	}
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint(participantLoginPath), bytes.NewReader(payload))
-	if err != nil {
-		return "", fmt.Errorf("consent client: failed to create login request: %w", err)
+	cacheKey := c.baseURL + "|" + did
+
+	participantSDMu.Lock()
+	entry, hit := participantSDCache[cacheKey]
+	participantSDMu.Unlock()
+	if hit && time.Now().Before(entry.expiry) {
+		return entry.selfDescriptionURL, nil
 	}
-	httpReq.Header.Set("Content-Type", ContentTypeJSON)
+
+	token, _, err := c.credentials(ctx, false)
+	if err != nil {
+		return "", err
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, c.endpoint(participantsPath), nil)
+	if err != nil {
+		return "", fmt.Errorf("consent client: failed to create participants request: %w", err)
+	}
+	httpReq.Header.Set("Authorization", "Bearer "+token)
 
 	status, body, err := c.do(httpReq)
 	if err != nil {
 		return "", err
 	}
+	if status == http.StatusUnauthorized {
+		return "", errParticipantUnauthorized
+	}
 	if status != http.StatusOK {
-		return "", fmt.Errorf("consent client: participant login returned status %d, body: %s",
-			status, truncateBody(body))
+		return "", fmt.Errorf("consent client: participants lookup returned status %d, body: %s", status, truncateBody(body))
 	}
-	var out loginResponse
+
+	participants, err := decodeParticipants(body)
+	if err != nil {
+		return "", err
+	}
+	for _, p := range participants {
+		if p.DID == did && p.SelfDescriptionURL != "" {
+			participantSDMu.Lock()
+			participantSDCache[cacheKey] = participantSDEntry{selfDescriptionURL: p.SelfDescriptionURL, expiry: time.Now().Add(participantSDCacheTTL)}
+			participantSDMu.Unlock()
+			return p.SelfDescriptionURL, nil
+		}
+	}
+	return "", fmt.Errorf("consent client: no participant registered for did %q", did)
+}
+
+// decodeParticipants accepts either a bare array or a {"participants": [...]}
+// wrapper, since the consent-manager has used both shapes.
+func decodeParticipants(body []byte) ([]participantListEntry, error) {
+	var bare []participantListEntry
+	if err := json.Unmarshal(body, &bare); err == nil {
+		return bare, nil
+	}
+	var wrapped participantsResponse
+	if err := json.Unmarshal(body, &wrapped); err != nil {
+		return nil, fmt.Errorf("consent client: failed to unmarshal participants response: %w", err)
+	}
+	return wrapped.Participants, nil
+}
+
+// ProviderSelfDescription returns this participant's self-description URL - the
+// static override when configured, otherwise the value derived from
+// GET /participants/me (cached with the participant token). Callers use it to
+// name the provider side of a contract lookup.
+func (c *Client) ProviderSelfDescription(ctx context.Context) (string, error) {
+	_, providerSD, err := c.credentials(ctx, false)
+	if err != nil {
+		return "", err
+	}
+	return providerSD, nil
+}
+
+// loginResponse is the consent-manager response to POST /participants/login.
+// tokenResponse is the OAuth2-shaped reply of the participant-local token service.
+type tokenResponse struct {
+	AccessToken string `json:"access_token"`
+	TokenType   string `json:"token_type"`
+	ExpiresIn   int64  `json:"expires_in"`
+}
+
+// tokenRequest asks the token service for a token for one configured audience.
+// The audience is a NAME the token service resolves against its own configuration,
+// never a URL - a caller that could name an arbitrary host would make the token
+// service present this participant's credential to it.
+type tokenRequest struct {
+	Audience string `json:"audience"`
+}
+
+// cacheFor returns how long a fetched token may be cached: the shorter of the
+// lifetime the token service reported and the configured cap, less a small skew
+// so a token is never presented in the last moments of its life. A service that
+// reports no usable lifetime falls back to the cap.
+func cacheFor(lifetime, maxLifetime time.Duration) time.Duration {
+	ttl := maxLifetime
+	if lifetime > 0 && lifetime < maxLifetime {
+		ttl = lifetime
+	}
+	if ttl > tokenRefreshSkew {
+		return ttl - tokenRefreshSkew
+	}
+	return ttl
+}
+
+// fetchToken asks the participant-local token service for an access token,
+// returning the token and the lifetime it reported.
+//
+// The plugin fails closed, so the returned error names the status: the token
+// service answers 502 when the verifier could not be reached (retryable) and
+// 403/400/500 when the credential was refused or it is misconfigured (terminal).
+func (c *Client) fetchToken(ctx context.Context) (string, time.Duration, error) {
+	payload, err := json.Marshal(tokenRequest{Audience: c.tokenAudience})
+	if err != nil {
+		return "", 0, fmt.Errorf("consent client: failed to marshal token request: %w", err)
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.tokenServiceURL, bytes.NewReader(payload))
+	if err != nil {
+		return "", 0, fmt.Errorf("consent client: failed to create token request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", ContentTypeJSON)
+
+	// Deliberately not c.do(): the token service is a local, same-namespace
+	// service, not the consent-manager, so the Host override and API prefix that
+	// c.do() applies for the gateway route must not be used here.
+	resp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return "", 0, fmt.Errorf("consent client: token service request failed: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", 0, fmt.Errorf("consent client: failed to read token response: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return "", 0, fmt.Errorf("consent client: token service returned status %d, body: %s",
+			resp.StatusCode, truncateBody(body))
+	}
+	var out tokenResponse
 	if err := json.Unmarshal(body, &out); err != nil {
-		return "", fmt.Errorf("consent client: failed to unmarshal login response: %w", err)
+		return "", 0, fmt.Errorf("consent client: failed to unmarshal token response: %w", err)
 	}
-	if out.JWT == "" {
-		return "", fmt.Errorf("consent client: participant login returned no token")
+	if out.AccessToken == "" {
+		return "", 0, fmt.Errorf("consent client: token service returned no access token")
 	}
-	return out.JWT, nil
+	return out.AccessToken, time.Duration(out.ExpiresIn) * time.Second, nil
 }
 
 // meResponse is the (subset of the) consent-manager response to GET /participants/me.
@@ -397,17 +576,25 @@ func (c *Client) resolveUserIdentifier(ctx context.Context, subject, providerSD,
 	return out.UserIdentifier, out.UserIdentifier != "", nil
 }
 
-// participantConsentsResponse is the consent-manager response to call 2.
+// participantConsentsResponse is the consent-manager response to call 2. The
+// ?receipt=true form returns the raw consents, each carrying its status and the
+// data resources it covers.
 type participantConsentsResponse struct {
 	Consents []struct {
 		Status string `json:"status"`
+		Data   []struct {
+			Resource string `json:"resource"`
+		} `json:"data"`
 	} `json:"consents"`
 }
 
 // hasGrantedConsent performs call 2: it lists the user identifier's consents as
-// seen by the participant and reports whether any is granted. A 401 is returned
-// as errParticipantUnauthorized so the caller can refresh the token and retry.
-func (c *Client) hasGrantedConsent(ctx context.Context, token, userIdentifier string) (bool, error) {
+// seen by the participant and reports whether any granted consent authorizes
+// access. When dataResource is empty the check is owner-level (any granted
+// consent suffices); otherwise a granted consent counts only if it covers that
+// resource (dataResource ∈ consent.data[].resource). A 401 is returned as
+// errParticipantUnauthorized so the caller can refresh the token and retry.
+func (c *Client) hasGrantedConsent(ctx context.Context, token, userIdentifier, dataResource string) (bool, error) {
 	endpoint := c.endpoint(fmt.Sprintf(participantConsentsPathFmt, url.PathEscape(userIdentifier))) + "?receipt=true"
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
@@ -431,8 +618,16 @@ func (c *Client) hasGrantedConsent(ctx context.Context, token, userIdentifier st
 		return false, fmt.Errorf("consent client: failed to unmarshal consents response: %w", err)
 	}
 	for _, consent := range out.Consents {
-		if consent.Status == grantedStatus {
+		if consent.Status != grantedStatus {
+			continue
+		}
+		if dataResource == "" {
 			return true, nil
+		}
+		for _, d := range consent.Data {
+			if d.Resource == dataResource {
+				return true, nil
+			}
 		}
 	}
 	return false, nil
@@ -448,6 +643,9 @@ func (c *Client) endpoint(path string) string {
 // not surface the *http.Response: the body is already consumed and closed, so
 // callers only need the status code and body bytes.
 func (c *Client) do(httpReq *http.Request) (statusCode int, body []byte, err error) {
+	if c.host != "" {
+		httpReq.Host = c.host
+	}
 	resp, err := c.httpClient.Do(httpReq)
 	if err != nil {
 		return 0, nil, fmt.Errorf("consent client: HTTP request failed: %w", err)

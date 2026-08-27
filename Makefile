@@ -13,7 +13,7 @@ GO_BUILD_FLAGS := -trimpath -ldflags="-s -w"
 # Coverage output file
 COVERAGE_FILE := coverage.out
 
-.PHONY: build test test-cover lint docker-build clean
+.PHONY: build test test-cover lint license-check license-fix docker-build clean
 
 ## build: Compile the go-runner binary
 build:
@@ -31,6 +31,14 @@ test-cover:
 ## lint: Run golangci-lint
 lint:
 	golangci-lint run ./...
+
+## license-check: Verify the Apache-2.0 copyright header on every Go file (CI runs this)
+license-check:
+	./hack/license-header.sh check
+
+## license-fix: Add the copyright header to Go files that lack it
+license-fix:
+	./hack/license-header.sh fix
 
 ## docker-build: Build the Docker image
 docker-build:

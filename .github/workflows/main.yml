@@ -28,6 +28,9 @@ permissions:
   security-events: write
 
 jobs:
+  license-headers:
+    uses: ./.github/workflows/license-headers.yml
+
   style-guide:
     uses: ./.github/workflows/style-guide.yml
 
@@ -42,6 +45,7 @@ jobs:
 
   release:
     needs:
+      - license-headers
       - style-guide
       - build
       - tests
