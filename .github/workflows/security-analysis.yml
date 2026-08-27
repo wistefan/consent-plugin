@@ -1,9 +1,22 @@
 name: Security Analysis
 
-# Reusable source-level security scanning. Findings are uploaded as SARIF to
-# the GitHub Security tab; scans never block the pipeline (continue-on-error).
+# Reusable source-level security scanning.
+#
+# The scans BLOCK the pipeline. They previously ran with continue-on-error, so a
+# known-vulnerable dependency merged cleanly and the findings were informational
+# only — a security gate that cannot fail is a dashboard, not a gate. SARIF is
+# still uploaded to the Security tab either way.
+#
+# Tool versions are pinned. `@latest` made CI non-reproducible (a scanner release
+# could redden an untouched PR) and put an unpinned binary in the build's trust
+# boundary. Keep GOSEC_VERSION and the golangci-lint version in .gitea/workflows/
+# and .github/workflows/style-guide.yml in step, so the two pipelines cannot
+# disagree about whether the code passes.
 on:
   workflow_call:
+
+env:
+  GOSEC_VERSION: v2.21.4
 
 jobs:
   govulncheck:
@@ -17,8 +30,12 @@ jobs:
         with:
           go-version-file: go.mod
 
+      # Verifies the module cache against go.sum before anything is built with it.
+      - name: Verify module checksums
+        run: go mod verify
+
       - uses: golang/govulncheck-action@v1.0.4
-        continue-on-error: true
+        id: govulncheck
         with:
           go-version-file: go.mod
           output-format: sarif
@@ -40,11 +57,14 @@ jobs:
         with:
           go-version-file: go.mod
 
+      - name: Install gosec
+        run: go install github.com/securego/gosec/v2/cmd/gosec@${{ env.GOSEC_VERSION }}
+
+      # -no-fail is deliberately NOT passed: a new finding must fail the PR.
+      # Suppress a reviewed finding at the call site with a #nosec comment
+      # carrying the reason, so the exception is visible in the diff.
       - name: Run gosec
-        continue-on-error: true
-        run: |
-          go install github.com/securego/gosec/v2/cmd/gosec@latest
-          gosec -fmt sarif -out gosec-results.sarif ./...
+        run: gosec -fmt sarif -out gosec-results.sarif ./...
 
       - uses: github/codeql-action/upload-sarif@v4
         if: always()

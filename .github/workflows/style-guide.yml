@@ -1,6 +1,10 @@
 name: Style Guide
 
 # Reusable lint check using the repository's .golangci.yml.
+#
+# The version is PINNED and must match .gitea/workflows/ci.yaml. With `latest`
+# here and a pin there, the two pipelines could disagree about whether the same
+# commit lints — and a golangci-lint release could redden an untouched PR.
 on:
   workflow_call:
 
@@ -17,4 +21,4 @@ jobs:
 
       - uses: golangci/golangci-lint-action@v9
         with:
-          version: latest
+          version: v2.13.1
