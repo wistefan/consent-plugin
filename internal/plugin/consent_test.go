@@ -18,12 +18,14 @@
 package plugin
 
 import (
+	"consent-plugin/internal/audit"
 	"consent-plugin/internal/ownerresolver"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -865,4 +867,119 @@ func TestDenyResponse_StripsUpstreamHeaders(t *testing.T) {
 	assert.Equal(t, strconv.Itoa(len(DefaultDenyResponseBody)), resp.header.Get("Content-Length"),
 		"Content-Length must describe the deny body, not the upstream's")
 	assert.Equal(t, DefaultDenyResponseBody, string(resp.writtenBody))
+}
+
+// TestRecordAudit_RecordsEveryCheckedOwner verifies the audit log answers whose
+// consent was checked and what each said. Recording only the response outcome
+// named no owner at all on an allow, and only the first refusal on a deny —
+// which is not what an access-decision log is for.
+func TestRecordAudit_RecordsEveryCheckedOwner(t *testing.T) {
+	type record struct {
+		subject, decision string
+	}
+	var mu sync.Mutex
+	var got []record
+
+	collector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload struct {
+			ResourceLogs []struct {
+				ScopeLogs []struct {
+					LogRecords []struct {
+						Attributes []struct {
+							Key   string `json:"key"`
+							Value struct {
+								StringValue string `json:"stringValue"`
+							} `json:"value"`
+						} `json:"attributes"`
+					} `json:"logRecords"`
+				} `json:"scopeLogs"`
+			} `json:"resourceLogs"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Errorf("failed to decode OTLP payload: %v", err)
+		}
+		mu.Lock()
+		for _, rl := range payload.ResourceLogs {
+			for _, sl := range rl.ScopeLogs {
+				for _, lr := range sl.LogRecords {
+					var rec record
+					for _, attr := range lr.Attributes {
+						switch attr.Key {
+						case "enduser.id":
+							rec.subject = attr.Value.StringValue
+						case "consent.decision":
+							rec.decision = attr.Value.StringValue
+						}
+					}
+					got = append(got, rec)
+				}
+			}
+		}
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer collector.Close()
+
+	cfg := &Config{
+		AuditEnabled:      true,
+		AuditOTLPEndpoint: collector.URL,
+		AuditServiceName:  "consent-access-audit-test",
+		ConsentAPITimeout: DefaultConsentAPITimeout,
+	}
+	recordAudit(cfg, responseOutcome{
+		decision:  decisionDeny,
+		requestID: "req-1",
+		method:    "GET",
+		checked: []checkedOwner{
+			{subject: "did:key:zA", resource: "/r", decision: decisionAllow},
+			{subject: "did:key:zB", resource: "/r", decision: decisionDeny, reason: "no granted consent"},
+		},
+	})
+	audit.ShutdownAll()
+
+	mu.Lock()
+	defer mu.Unlock()
+	assert.ElementsMatch(t, []record{
+		{subject: "did:key:zA", decision: decisionAllow},
+		{subject: "did:key:zB", decision: decisionDeny},
+	}, got, "every consulted owner must appear in the audit log, not only the one that denied")
+}
+
+// TestRecordAudit_RecordsOutcomeWhenNoOwnerReached verifies a request that
+// failed before any owner was consulted still appears in the record.
+func TestRecordAudit_RecordsOutcomeWhenNoOwnerReached(t *testing.T) {
+	var mu sync.Mutex
+	records := 0
+	collector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload struct {
+			ResourceLogs []struct {
+				ScopeLogs []struct {
+					LogRecords []json.RawMessage `json:"logRecords"`
+				} `json:"scopeLogs"`
+			} `json:"resourceLogs"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&payload)
+		mu.Lock()
+		for _, rl := range payload.ResourceLogs {
+			for _, sl := range rl.ScopeLogs {
+				records += len(sl.LogRecords)
+			}
+		}
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer collector.Close()
+
+	cfg := &Config{
+		AuditEnabled:      true,
+		AuditOTLPEndpoint: collector.URL,
+		AuditServiceName:  "consent-access-audit-no-owner",
+		ConsentAPITimeout: DefaultConsentAPITimeout,
+	}
+	recordAudit(cfg, responseOutcome{decision: decisionDeny, requestID: "req-2", reason: "owner resolver error"})
+	audit.ShutdownAll()
+
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Equal(t, 1, records, "a failure before any owner was reached must still be recorded")
 }

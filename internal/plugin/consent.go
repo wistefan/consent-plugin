@@ -154,6 +154,12 @@ const (
 
 // responseOutcome is the result of evaluating consent for one response: the
 // decision to enforce plus the fields needed to record it in the audit log.
+//
+// checked carries one entry per data owner whose consent was actually consulted.
+// Recording only the outcome answered "was this response allowed?" but not
+// "whose consent was checked, and what did each say?" — which is the question an
+// access-decision audit log exists to answer. On an allow it named no owner at
+// all, and on a deny only the first owner to refuse.
 type responseOutcome struct {
 	decision  string // decisionAllow | decisionDeny
 	reason    string
@@ -161,6 +167,15 @@ type responseOutcome struct {
 	subject   string
 	resource  string
 	method    string
+	checked   []checkedOwner
+}
+
+// checkedOwner is one data owner's consent decision within a response.
+type checkedOwner struct {
+	subject  string
+	resource string
+	decision string
+	reason   string
 }
 
 // ResponseFilter gates the upstream response on the data owner's consent.
@@ -365,6 +380,7 @@ func checkOwners(ctx context.Context, cfg *Config, key string, reqCtx *RequestCo
 		outcome   responseOutcome
 		err       error
 		request   consent.ConsentRequest
+		record    checkedOwner
 		problem   bool
 		attempted bool
 	}
@@ -397,6 +413,7 @@ func checkOwners(ctx context.Context, cfg *Config, key string, reqCtx *RequestCo
 			}
 			results[i].attempted = true
 			results[i].request = req
+			ownerResource := resourceOrPath(claim.dataResource, reqCtx.Path)
 
 			resp, err := client.CheckConsent(checksCtx, req)
 			switch {
@@ -404,15 +421,22 @@ func checkOwners(ctx context.Context, cfg *Config, key string, reqCtx *RequestCo
 				results[i].err = err
 				results[i].problem = true
 			case resp.Decision != consent.DecisionAllow:
+				results[i].record = checkedOwner{
+					subject: claim.owner, resource: ownerResource, decision: decisionDeny, reason: resp.Reason,
+				}
 				results[i].outcome = responseOutcome{
 					decision:  decisionDeny,
 					reason:    resp.Reason,
 					requestID: key,
 					subject:   claim.owner,
-					resource:  resourceOrPath(claim.dataResource, reqCtx.Path),
+					resource:  ownerResource,
 					method:    reqCtx.Method,
 				}
 				results[i].problem = true
+			default:
+				results[i].record = checkedOwner{
+					subject: claim.owner, resource: ownerResource, decision: decisionAllow, reason: resp.Reason,
+				}
 			}
 			if results[i].problem {
 				// Nothing the other owners could say would change a deny_all
@@ -422,6 +446,15 @@ func checkOwners(ctx context.Context, cfg *Config, key string, reqCtx *RequestCo
 		}(i, claim)
 	}
 	wg.Wait()
+
+	// Every owner that was actually consulted is recorded, whatever the verdict,
+	// so the audit log names them all rather than only the first refusal.
+	checked := make([]checkedOwner, 0, len(results))
+	for _, result := range results {
+		if result.attempted && result.record.subject != "" {
+			checked = append(checked, result.record)
+		}
+	}
 
 	for _, result := range results {
 		if !result.attempted || !result.problem {
@@ -435,11 +468,15 @@ func checkOwners(ctx context.Context, cfg *Config, key string, reqCtx *RequestCo
 			}
 			log.Printf("[consent-filter] ResponseFilter: consent check error for request %s: %v", key, result.err)
 			req := result.request
-			return failOutcome(cfg, failModeForError(result.err), "consent check error: "+result.err.Error(), key, &req)
+			outcome := failOutcome(cfg, failModeForError(result.err), "consent check error: "+result.err.Error(), key, &req)
+			outcome.checked = checked
+			return outcome
 		}
-		return result.outcome
+		outcome := result.outcome
+		outcome.checked = checked
+		return outcome
 	}
-	return responseOutcome{decision: decisionAllow, requestID: key, resource: reqCtx.Path, method: reqCtx.Method}
+	return responseOutcome{decision: decisionAllow, requestID: key, resource: reqCtx.Path, method: reqCtx.Method, checked: checked}
 }
 
 // clientConfigFromCfg builds the consent-manager client config from the plugin config.
@@ -516,23 +553,47 @@ func failModeForError(err error) failMode {
 
 // recordAudit emits the decision to the audit sink when auditing is enabled.
 // The emit is asynchronous and best-effort, so it never affects the decision.
+//
+// One record is emitted per data owner whose consent was consulted, so the log
+// can answer whose consent was checked and what each said — not merely whether
+// the response was released. When no owner was reached (a failure before or
+// during resolution) the outcome itself is recorded instead, so the request
+// still appears in the record.
 func recordAudit(cfg *Config, outcome responseOutcome) {
 	if !cfg.AuditEnabled {
 		return
 	}
-	audit.Get(audit.Config{
+	emitter := audit.Get(audit.Config{
 		Endpoint:    cfg.AuditOTLPEndpoint,
 		ServiceName: cfg.AuditServiceName,
 		Timeout:     time.Duration(cfg.ConsentAPITimeout) * time.Millisecond,
-	}).Emit(audit.Event{
-		Time:      time.Now(),
-		RequestID: outcome.requestID,
-		Subject:   outcome.subject,
-		Resource:  outcome.resource,
-		Method:    outcome.method,
-		Decision:  outcome.decision,
-		Reason:    outcome.reason,
+		Headers:     cfg.AuditOTLPHeaders,
 	})
+	now := time.Now()
+
+	if len(outcome.checked) == 0 {
+		emitter.Emit(audit.Event{
+			Time:      now,
+			RequestID: outcome.requestID,
+			Subject:   outcome.subject,
+			Resource:  outcome.resource,
+			Method:    outcome.method,
+			Decision:  outcome.decision,
+			Reason:    outcome.reason,
+		})
+		return
+	}
+	for _, checked := range outcome.checked {
+		emitter.Emit(audit.Event{
+			Time:      now,
+			RequestID: outcome.requestID,
+			Subject:   checked.subject,
+			Resource:  checked.resource,
+			Method:    outcome.method,
+			Decision:  checked.decision,
+			Reason:    checked.reason,
+		})
+	}
 }
 
 // deniedResponseHeaderPrefixes are the only upstream response headers allowed to

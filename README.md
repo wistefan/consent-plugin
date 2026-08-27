@@ -126,6 +126,7 @@ Configured via the APISIX route plugin JSON (identically on both `ext-plugin-pre
 | `fail_open` | `bool` | No | `false` | On a **dependency failure** (resolver or consent-manager down/erroring, unreadable body): `false` denies, `true` passes through. Enabling it is logged as a warning at parse time. It does **not** apply to structural failures — no correlation id, no request context, no participant credentials, or "consent required but no owner resolved" — which always deny. |
 | `audit_enabled` | `bool` | No | `false` | Emit an access-decision audit event (OTLP/HTTP log) to a Collector for every decision. Async + best-effort; never affects the decision. |
 | `audit_otlp_endpoint` | `string` | Yes† | — | Base OTLP/HTTP endpoint of the Collector (e.g. `http://otel-collector:4318`); `/v1/logs` is appended. Falls back to `CONSENT_AUDIT_OTLP_ENDPOINT`. |
+| `audit_otlp_headers` | `object` | No | — | Extra HTTP headers sent on every audit export, for a Collector that requires authentication (e.g. `{"Authorization":"Bearer ..."}`). |
 | `audit_service_name` | `string` | No | `consent-access-audit` | Resource `service.name` on audit records — the marker the Collector routes on to keep audit logs separate from traces. |
 
 \* Provide **either** `token_service_url` (recommended) **or** a static
@@ -142,7 +143,7 @@ route config; a value in the config always wins. The plugin runner inherits thes
 from the APISIX container, which sources them from a Kubernetes Secret — so
 secrets need not be stored as plaintext in the route config (etcd).
 
-**Access audit log.** With `audit_enabled`, the plugin emits one OTLP/HTTP **log record** per decision to `audit_otlp_endpoint`, stamped with resource `service.name=<audit_service_name>` and attributes `event.domain=audit`, `consent.decision`, `consent.reason`, `enduser.id`, `http.request.method`, `url.path`, `http.request.id`. Emission is asynchronous, batched, and best-effort (a bounded queue drops rather than blocking the request path), so a slow/absent Collector never affects data access. Mark-based routing lets the Collector send these to an append-only audit sink separate from traces.
+**Access audit log.** With `audit_enabled`, the plugin emits one OTLP/HTTP **log record** per **checked data owner** (so the log answers whose consent was consulted and what each said, not merely whether the response was released; a request that failed before any owner was reached is recorded once as itself) to `audit_otlp_endpoint`, stamped with resource `service.name=<audit_service_name>` and attributes `event.domain=audit`, `consent.decision`, `consent.reason`, `enduser.id`, `http.request.method`, `url.path`, `http.request.id`. Emission is asynchronous, batched, and best-effort (a bounded queue drops rather than blocking the request path), so a slow/absent Collector never affects data access. The queue is flushed on `SIGTERM`/`SIGINT`, so a redeploy does not discard the last flush interval of decisions. Reasons are sanitised before export (control characters collapsed, length bounded) so an upstream error body cannot reach the audit sink verbatim. Mark-based routing lets the Collector send these to an append-only audit sink separate from traces.
 
 ## APISIX Route Configuration Example
 

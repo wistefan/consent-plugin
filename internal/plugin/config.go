@@ -270,6 +270,11 @@ type Config struct {
 	// AuditEnabled. Falls back to the EnvAuditOTLPEndpoint env var when empty.
 	AuditOTLPEndpoint string `json:"audit_otlp_endpoint,omitempty"`
 
+	// AuditOTLPHeaders are extra HTTP headers sent on every audit export, for a
+	// Collector that requires authentication (e.g. {"Authorization": "Bearer ..."}
+	// or a tenant header).
+	AuditOTLPHeaders map[string]string `json:"audit_otlp_headers,omitempty"`
+
 	// AuditServiceName is the resource service.name stamped on audit records -
 	// the marker the Collector routes on to keep audit logs separate from traces.
 	// Empty defaults to the audit package's DefaultServiceName.
