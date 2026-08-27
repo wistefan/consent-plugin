@@ -37,6 +37,10 @@ const tokenServicePath = "/internal/tokens"
 // testAudience is the configured token-service target the tests ask for.
 const testAudience = "consent-manager"
 
+// testConsumerSD is the self-description URL of the participant the data is
+// released to — the consumer every check is scoped to.
+const testConsumerSD = "http://catalog/participants/consumer"
+
 // mockCM is a configurable mock covering the four endpoints the client uses: the
 // participant-local token service (/internal/tokens, served here for convenience
 // on the same test server), plus the consent-manager's /participants/me,
@@ -48,6 +52,8 @@ type mockCM struct {
 	statuses            []string   // consents statuses
 	resourcesPerConsent [][]string // optional data[].resource per consent (index-aligned with statuses)
 	selfDescriptionURL  string     // /me result
+	consentConsumer     string     // consumer the returned consents name (defaults to testConsumerSD)
+	consentPurposes     []string   // optional purposes the returned consents cover
 	tokenStatus         int        // non-200 => the token service fails with this status
 	failFirstConsents   bool       // first consents call 401s, then succeeds
 	// recording
@@ -120,6 +126,13 @@ func newMockCM(t *testing.T, m *mockCM) *httptest.Server {
 		fail := m.failFirstConsents
 		sts := append([]string(nil), m.statuses...)
 		res := append([][]string(nil), m.resourcesPerConsent...)
+		consumer := m.consentConsumer
+		if consumer == "" {
+			consumer = testConsumerSD
+		}
+		// "none" makes the mock return a consent record that names no consumer.
+		omitConsumer := consumer == "none"
+		purposes := append([]string(nil), m.consentPurposes...)
 		m.mu.Unlock()
 		if fail && n == 1 {
 			w.WriteHeader(http.StatusUnauthorized)
@@ -128,6 +141,16 @@ func newMockCM(t *testing.T, m *mockCM) *httptest.Server {
 		consents := make([]map[string]interface{}, 0, len(sts))
 		for i, s := range sts {
 			consent := map[string]interface{}{"status": s}
+			if !omitConsumer {
+				consent["consumer"] = map[string]string{"selfDescriptionURL": consumer}
+			}
+			if len(purposes) > 0 {
+				ps := make([]map[string]string, 0, len(purposes))
+				for _, p := range purposes {
+					ps = append(ps, map[string]string{"purpose": p})
+				}
+				consent["purposes"] = ps
+			}
 			if i < len(res) {
 				data := make([]map[string]string, 0, len(res[i]))
 				for _, r := range res[i] {
@@ -161,7 +184,7 @@ func TestCheckConsent_HostOverride(t *testing.T) {
 	m := &mockCM{userID: "uid-1", selfDescriptionURL: "http://provider/sd", statuses: []string{"granted"}}
 	srv := newMockCM(t, m)
 	c := NewClient(ClientConfig{BaseURL: srv.URL, Host: "consent-manager.dataspace-authority.org", TokenServiceURL: srv.URL + tokenServicePath, TokenAudience: testAudience, ConsentKey: "ck"})
-	if _, err := c.CheckConsent(context.Background(), ConsentRequest{Subject: "alice-42"}); err != nil {
+	if _, err := c.CheckConsent(context.Background(), ConsentRequest{Subject: "alice-42", Consumer: testConsumerSD}); err != nil {
 		t.Fatalf("CheckConsent: %v", err)
 	}
 	if m.lastHost != "consent-manager.dataspace-authority.org" {
@@ -191,17 +214,17 @@ func TestCheckConsent_ResourceScoped(t *testing.T) {
 	c := NewClient(ClientConfig{BaseURL: srv.URL, ConsentKey: "ck", TokenServiceURL: srv.URL + tokenServicePath, TokenAudience: testAudience})
 
 	// resource covered by a granted consent -> allow
-	resp, err := c.CheckConsent(context.Background(), ConsentRequest{Subject: "alice-42", DataResource: "urn:ngsi-ld:PersonalProfile:alice"})
+	resp, err := c.CheckConsent(context.Background(), ConsentRequest{Subject: "alice-42", Consumer: testConsumerSD, DataResource: "urn:ngsi-ld:PersonalProfile:alice"})
 	require.NoError(t, err)
 	assert.Equal(t, DecisionAllow, resp.Decision)
 
 	// a different resource -> deny (the consent does not cover it)
-	resp, err = c.CheckConsent(context.Background(), ConsentRequest{Subject: "alice-42", DataResource: "urn:ngsi-ld:PersonalProfile:bob"})
+	resp, err = c.CheckConsent(context.Background(), ConsentRequest{Subject: "alice-42", Consumer: testConsumerSD, DataResource: "urn:ngsi-ld:PersonalProfile:bob"})
 	require.NoError(t, err)
 	assert.Equal(t, DecisionDeny, resp.Decision)
 
 	// owner-level (no resource) -> allow on any granted consent
-	resp, err = c.CheckConsent(context.Background(), ConsentRequest{Subject: "alice-42"})
+	resp, err = c.CheckConsent(context.Background(), ConsentRequest{Subject: "alice-42", Consumer: testConsumerSD})
 	require.NoError(t, err)
 	assert.Equal(t, DecisionAllow, resp.Decision)
 }
@@ -229,25 +252,43 @@ func TestCheckConsent(t *testing.T) {
 		uid     = "6a71e3567917ddaef2e2c866"
 	)
 	tests := []struct {
-		name         string
-		userID       string
-		statuses     []string
-		wantDecision Decision
+		name            string
+		userID          string
+		statuses        []string
+		consentConsumer string // consumer the mock's consents were granted to
+		requestConsumer string // consumer the check is made for
+		wantDecision    Decision
 	}{
 		{name: "granted -> allow", userID: uid, statuses: []string{"granted"}, wantDecision: DecisionAllow},
 		{name: "one of many granted -> allow", userID: uid, statuses: []string{"revoked", "granted"}, wantDecision: DecisionAllow},
 		{name: "only revoked -> deny", userID: uid, statuses: []string{"revoked"}, wantDecision: DecisionDeny},
 		{name: "no consents -> deny", userID: uid, statuses: []string{}, wantDecision: DecisionDeny},
 		{name: "unknown subject (404) -> deny", userID: "", statuses: nil, wantDecision: DecisionDeny},
+		{
+			name: "granted to another consumer -> deny", userID: uid, statuses: []string{"granted"},
+			consentConsumer: "http://catalog/participants/someone-else", wantDecision: DecisionDeny,
+		},
+		{
+			name: "consent naming no consumer -> deny", userID: uid, statuses: []string{"granted"},
+			consentConsumer: "none", wantDecision: DecisionDeny,
+		},
+		{
+			name: "no consumer in the request -> deny", userID: uid, statuses: []string{"granted"},
+			requestConsumer: "none", wantDecision: DecisionDeny,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			resetCredCache()
-			m := &mockCM{userID: tt.userID, statuses: tt.statuses}
+			m := &mockCM{userID: tt.userID, statuses: tt.statuses, consentConsumer: tt.consentConsumer}
 			srv := newMockCM(t, m)
 			c := NewClient(ClientConfig{BaseURL: srv.URL, ConsentKey: "ck", ParticipantToken: "static-token", ProviderSD: provSD})
 
-			resp, err := c.CheckConsent(context.Background(), ConsentRequest{Subject: subject})
+			requestConsumer := testConsumerSD
+			if tt.requestConsumer == "none" {
+				requestConsumer = ""
+			}
+			resp, err := c.CheckConsent(context.Background(), ConsentRequest{Subject: subject, Consumer: requestConsumer})
 			require.NoError(t, err)
 			assert.Equal(t, tt.wantDecision, resp.Decision)
 
@@ -255,6 +296,10 @@ func TestCheckConsent(t *testing.T) {
 			defer m.mu.Unlock()
 			assert.Equal(t, 0, m.tokenCalls, "static token must not call the token service")
 			assert.Equal(t, 0, m.meCalls, "static SD must not trigger /me")
+			if tt.requestConsumer == "none" {
+				assert.Equal(t, 0, m.searchCalls, "a check without a consumer must not reach the consent-manager")
+				return
+			}
 			assert.Equal(t, "ck", m.lastConsentKey)
 			assert.Equal(t, provSD, m.lastSearchSD)
 			assert.Equal(t, subject, m.lastSearchEmail)
@@ -273,7 +318,7 @@ func TestCheckConsent_TokenService(t *testing.T) {
 	srv := newMockCM(t, m)
 	c := NewClient(ClientConfig{BaseURL: srv.URL, ConsentKey: "ck", TokenServiceURL: srv.URL + tokenServicePath, TokenAudience: testAudience})
 
-	resp, err := c.CheckConsent(context.Background(), ConsentRequest{Subject: "did:key:z"})
+	resp, err := c.CheckConsent(context.Background(), ConsentRequest{Subject: "did:key:z", Consumer: testConsumerSD})
 	require.NoError(t, err)
 	assert.Equal(t, DecisionAllow, resp.Decision)
 
@@ -295,7 +340,7 @@ func TestCheckConsent_TokenAndSDCached(t *testing.T) {
 	c := NewClient(ClientConfig{BaseURL: srv.URL, ConsentKey: "ck", TokenServiceURL: srv.URL + tokenServicePath, TokenAudience: testAudience})
 
 	for i := 0; i < 3; i++ {
-		resp, err := c.CheckConsent(context.Background(), ConsentRequest{Subject: "did:key:z"})
+		resp, err := c.CheckConsent(context.Background(), ConsentRequest{Subject: "did:key:z", Consumer: testConsumerSD})
 		require.NoError(t, err)
 		assert.Equal(t, DecisionAllow, resp.Decision)
 	}
@@ -315,7 +360,7 @@ func TestCheckConsent_401RefreshRetry(t *testing.T) {
 	srv := newMockCM(t, m)
 	c := NewClient(ClientConfig{BaseURL: srv.URL, ConsentKey: "ck", TokenServiceURL: srv.URL + tokenServicePath, TokenAudience: testAudience})
 
-	resp, err := c.CheckConsent(context.Background(), ConsentRequest{Subject: "did:key:z"})
+	resp, err := c.CheckConsent(context.Background(), ConsentRequest{Subject: "did:key:z", Consumer: testConsumerSD})
 	require.NoError(t, err)
 	assert.Equal(t, DecisionAllow, resp.Decision)
 
@@ -333,7 +378,7 @@ func TestCheckConsent_TokenServiceFailure(t *testing.T) {
 	srv := newMockCM(t, m)
 	c := NewClient(ClientConfig{BaseURL: srv.URL, ConsentKey: "ck", TokenServiceURL: srv.URL + tokenServicePath, TokenAudience: testAudience})
 
-	_, err := c.CheckConsent(context.Background(), ConsentRequest{Subject: "did:key:z"})
+	_, err := c.CheckConsent(context.Background(), ConsentRequest{Subject: "did:key:z", Consumer: testConsumerSD})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "token service returned status 404")
 }
@@ -346,7 +391,7 @@ func TestCheckConsent_ProviderSDOverride(t *testing.T) {
 	srv := newMockCM(t, m)
 	c := NewClient(ClientConfig{BaseURL: srv.URL, ConsentKey: "ck", TokenServiceURL: srv.URL + tokenServicePath, TokenAudience: testAudience, ProviderSD: "http://facade/explicit"})
 
-	resp, err := c.CheckConsent(context.Background(), ConsentRequest{Subject: "did:key:z"})
+	resp, err := c.CheckConsent(context.Background(), ConsentRequest{Subject: "did:key:z", Consumer: testConsumerSD})
 	require.NoError(t, err)
 	assert.Equal(t, DecisionAllow, resp.Decision)
 
@@ -364,7 +409,7 @@ func TestCheckConsent_EmptySubject(t *testing.T) {
 	srv := newMockCM(t, m)
 	c := NewClient(ClientConfig{BaseURL: srv.URL, ConsentKey: "ck", TokenServiceURL: srv.URL + tokenServicePath, TokenAudience: testAudience})
 
-	resp, err := c.CheckConsent(context.Background(), ConsentRequest{Subject: ""})
+	resp, err := c.CheckConsent(context.Background(), ConsentRequest{Subject: "", Consumer: testConsumerSD})
 	require.NoError(t, err)
 	assert.Equal(t, DecisionDeny, resp.Decision)
 	m.mu.Lock()
@@ -378,7 +423,7 @@ func TestCheckConsent_EmptySubject(t *testing.T) {
 func TestCheckConsent_MissingTokenSource(t *testing.T) {
 	resetCredCache()
 	c := NewClient(ClientConfig{BaseURL: "http://cm:3000", ConsentKey: "ck"})
-	_, err := c.CheckConsent(context.Background(), ConsentRequest{Subject: "did:key:z"})
+	_, err := c.CheckConsent(context.Background(), ConsentRequest{Subject: "did:key:z", Consumer: testConsumerSD})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "no participant_token and no token_service_url")
 }
@@ -391,7 +436,7 @@ func TestCheckConsent_EmptyConsentKeyOmitsHeader(t *testing.T) {
 	m := &mockCM{userID: "uid-1", statuses: []string{"granted"}}
 	srv := newMockCM(t, m)
 	c := NewClient(ClientConfig{BaseURL: srv.URL, ParticipantToken: "t", ProviderSD: "sd"})
-	resp, err := c.CheckConsent(context.Background(), ConsentRequest{Subject: "did:key:z"})
+	resp, err := c.CheckConsent(context.Background(), ConsentRequest{Subject: "did:key:z", Consumer: testConsumerSD})
 	require.NoError(t, err)
 	assert.Equal(t, DecisionAllow, resp.Decision)
 	assert.Empty(t, m.lastConsentKey, "empty consent key must not be sent as a header")
@@ -414,7 +459,7 @@ func TestCheckConsent_ConcurrentTokenFetchCoalesced(t *testing.T) {
 			defer wg.Done()
 			// Same base URL + client id => same cache key, so the login must coalesce.
 			c := NewClient(ClientConfig{BaseURL: srv.URL, TokenServiceURL: srv.URL + tokenServicePath, TokenAudience: testAudience})
-			resp, err := c.CheckConsent(context.Background(), ConsentRequest{Subject: "did:key:z"})
+			resp, err := c.CheckConsent(context.Background(), ConsentRequest{Subject: "did:key:z", Consumer: testConsumerSD})
 			if err != nil {
 				errs <- err
 			} else if resp.Decision != DecisionAllow {
@@ -438,7 +483,7 @@ func TestCheckConsent_ConcurrentTokenFetchCoalesced(t *testing.T) {
 func TestCheckConsentTransportFailure(t *testing.T) {
 	resetCredCache()
 	c := NewClient(ClientConfig{BaseURL: "http://localhost:1", ConsentKey: "ck", ParticipantToken: "t", ProviderSD: "sd", TimeoutMs: MinTimeoutMs})
-	_, err := c.CheckConsent(context.Background(), ConsentRequest{Subject: "did:key:z"})
+	_, err := c.CheckConsent(context.Background(), ConsentRequest{Subject: "did:key:z", Consumer: testConsumerSD})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "HTTP request failed")
 }
@@ -453,7 +498,7 @@ func TestCheckConsentContextCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	c := NewClient(ClientConfig{BaseURL: srv.URL, ConsentKey: "ck", ParticipantToken: "t", ProviderSD: "sd"})
-	_, err := c.CheckConsent(ctx, ConsentRequest{Subject: "did:key:z"})
+	_, err := c.CheckConsent(ctx, ConsentRequest{Subject: "did:key:z", Consumer: testConsumerSD})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "HTTP request failed")
 }
@@ -564,7 +609,9 @@ func TestCheckConsent_SeparateTokenServicesDoNotShareToken(t *testing.T) {
 		mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
-			"consents": []map[string]string{{"status": grantedStatus}},
+			"consents": []map[string]interface{}{
+				{"status": grantedStatus, "consumer": map[string]string{"selfDescriptionURL": testConsumerSD}},
+			},
 		})
 	})
 	consentManager := httptest.NewServer(mux)
@@ -590,7 +637,7 @@ func TestCheckConsent_SeparateTokenServicesDoNotShareToken(t *testing.T) {
 			TokenServiceURL: newTokenService(token).URL,
 			TokenAudience:   testAudience,
 		})
-		resp, err := c.CheckConsent(context.Background(), ConsentRequest{Subject: "did:key:z"})
+		resp, err := c.CheckConsent(context.Background(), ConsentRequest{Subject: "did:key:z", Consumer: testConsumerSD})
 		require.NoError(t, err)
 		require.Equal(t, DecisionAllow, resp.Decision)
 	}

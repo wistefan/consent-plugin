@@ -254,6 +254,10 @@ func (c *ConsentFilter) evaluateWithResolver(cfg *Config, w pkgHTTP.Response, ke
 			resolveParties.Consumer = consumerSD
 		}
 	}
+	// The consumer also scopes the consent match itself: a consent names the one
+	// participant it was granted to, so releasing data to any other participant
+	// on the strength of it would authorise an agreement the subject never made.
+	consumerSD := resolveParties.Consumer
 	if providerSD, sdErr := consentClient.ProviderSelfDescription(context.Background()); sdErr != nil {
 		log.Printf("[consent-filter] ResponseFilter: could not determine the provider self-description for request %s: %v", key, sdErr)
 	} else {
@@ -296,6 +300,8 @@ func (c *ConsentFilter) evaluateWithResolver(cfg *Config, w pkgHTTP.Response, ke
 			Resource:     reqCtx.Path,
 			Method:       reqCtx.Method,
 			DataResource: claim.DataResource,
+			Consumer:     consumerSD,
+			Purpose:      claim.Purpose,
 		}
 		resp, err := consentClient.CheckConsent(context.Background(), req)
 		if err != nil {

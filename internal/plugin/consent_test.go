@@ -166,21 +166,12 @@ func newConsentManager(t *testing.T, userID string, statuses []string) *httptest
 		_ = json.NewEncoder(w).Encode(map[string]string{"userIdentifier": userID})
 	})
 	mux.HandleFunc("/v1/consents/participants/", func(w http.ResponseWriter, r *http.Request) {
-		consents := make([]map[string]string, 0, len(statuses))
-		for _, s := range statuses {
-			consents = append(consents, map[string]string{"status": s})
-		}
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{"consents": consents})
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"consents": consentsGrantedTo(testConsumerSD, statuses)})
 	})
 	// The participant registry, used to translate the consumer DID from the token
 	// into the self-description URL a contract names its parties by.
-	mux.HandleFunc("/v1/participants", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode([]map[string]string{
-			{"did": testConsumerDID, "selfDescriptionURL": "http://catalog/participants/consumer"},
-		})
-	})
+	mux.HandleFunc("/v1/participants", participantRegistryHandler)
 	mux.HandleFunc("/v1/participants/me", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]string{
@@ -190,12 +181,26 @@ func newConsentManager(t *testing.T, userID string, statuses []string) *httptest
 	return httptest.NewServer(mux)
 }
 
-// newFailingConsentManager returns a consent-manager that answers every call
-// with the given status code (used to exercise the fail policy).
+// newFailingConsentManager returns a consent-manager whose CONSENT CHECK calls
+// answer with the given status code (used to exercise the fail policy). The
+// participant registry still answers, so the failure under test is the check
+// itself and not the preceding contract lookup.
 func newFailingConsentManager(status int) *httptest.Server {
-	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/participants", participantRegistryHandler)
+	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(status)
-	}))
+	})
+	return httptest.NewServer(mux)
+}
+
+// participantRegistryHandler serves the consent-manager's participant registry,
+// which maps the consumer DID from the token to its self-description URL.
+func participantRegistryHandler(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode([]map[string]string{
+		{"did": testConsumerDID, "selfDescriptionURL": testConsumerSD},
+	})
 }
 
 // newUncalledConsentManager fails the test if a CONSENT CHECK reaches the
@@ -205,12 +210,7 @@ func newFailingConsentManager(status int) *httptest.Server {
 func newUncalledConsentManager(t *testing.T) *httptest.Server {
 	t.Helper()
 	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/participants", func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode([]map[string]string{
-			{"did": testConsumerDID, "selfDescriptionURL": "http://catalog/participants/consumer"},
-		})
-	})
+	mux.HandleFunc("/v1/participants", participantRegistryHandler)
 	mux.HandleFunc("/", func(_ http.ResponseWriter, r *http.Request) {
 		t.Errorf("consent-manager must not be called for a consent check (path %s)", r.URL.Path)
 	})
@@ -307,6 +307,23 @@ const testOwnerDID = "did:key:zOwner"
 
 // testConsumerDID is the requesting participant named in the token claims.
 const testConsumerDID = "did:key:zConsumer"
+
+// testConsumerSD is the self-description URL the participant registry maps
+// testConsumerDID to — the consumer every consent check is scoped to.
+const testConsumerSD = "http://catalog/participants/consumer"
+
+// consentsGrantedTo builds consent records with the given statuses, each granted
+// to the named consuming participant.
+func consentsGrantedTo(consumer string, statuses []string) []map[string]interface{} {
+	consents := make([]map[string]interface{}, 0, len(statuses))
+	for _, s := range statuses {
+		consents = append(consents, map[string]interface{}{
+			"status":   s,
+			"consumer": map[string]string{"selfDescriptionURL": consumer},
+		})
+	}
+	return consents
+}
 
 // --- ResponseFilter tests (coarse allow/deny gate) ---
 
@@ -537,6 +554,40 @@ func TestConsentFilter_ResponseFilter_DenySetsContentType(t *testing.T) {
 	assert.Equal(t, DefaultDenyStatusCode, resp.writtenStatus)
 }
 
+// TestResponseFilter_ConsentScopedToConsumer is the regression test for the
+// consumer scoping: the owner's consent was granted to a DIFFERENT participant,
+// so it is no authority for this consumer to read the data.
+func TestResponseFilter_ConsentScopedToConsumer(t *testing.T) {
+	clearContextStore()
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/users/identifier/search", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{"userIdentifier": "uid-owner"})
+	})
+	mux.HandleFunc("/v1/consents/participants/", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"consents": consentsGrantedTo("http://catalog/participants/someone-else", []string{"granted"}),
+		})
+	})
+	mux.HandleFunc("/v1/participants", participantRegistryHandler)
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	resolver := newOwnerResolver(t, ownedBy(testOwnerDID))
+	defer resolver.Close()
+
+	const id = uint32(203)
+	storeRequest(id)
+	resp := newMockResponse(id, []byte(`{"id":"urn:ngsi-ld:PersonalProfile:alice"}`))
+	(&ConsentFilter{}).ResponseFilter(newTestConfig(server.URL, resolver.URL+"/resolve"), resp)
+
+	assert.Equal(t, DefaultDenyStatusCode, resp.writtenStatus,
+		"a consent granted to another participant must not authorise this consumer")
+	assert.Equal(t, DefaultDenyResponseBody, string(resp.writtenBody))
+}
+
 // TestResponseFilter_OwnerNotRequestor is the regression test for the removed
 // legacy mode: the consent that decides access must be the RESOLVED OWNER's, not
 // the caller's. The resolver names Bob as the owner while the token's "sub" is
@@ -557,16 +608,9 @@ func TestResponseFilter_OwnerNotRequestor(t *testing.T) {
 	})
 	mux.HandleFunc("/v1/consents/participants/", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{
-			"consents": []map[string]string{{"status": "revoked"}},
-		})
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"consents": consentsGrantedTo(testConsumerSD, []string{"revoked"})})
 	})
-	mux.HandleFunc("/v1/participants", func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode([]map[string]string{
-			{"did": testConsumerDID, "selfDescriptionURL": "http://catalog/participants/consumer"},
-		})
-	})
+	mux.HandleFunc("/v1/participants", participantRegistryHandler)
 	server := httptest.NewServer(mux)
 	defer server.Close()
 
@@ -576,9 +620,12 @@ func TestResponseFilter_OwnerNotRequestor(t *testing.T) {
 	const id = uint32(202)
 	// The caller is Alice; the data belongs to Bob.
 	StoreRequestContext(testReqKey(id), &RequestContext{
-		Method:    "GET",
-		Path:      "/ngsi-ld/v1/entities/urn:ngsi-ld:PersonalProfile:bob",
-		JWTClaims: map[string]interface{}{"sub": "did:key:zAlice"},
+		Method: "GET",
+		Path:   "/ngsi-ld/v1/entities/urn:ngsi-ld:PersonalProfile:bob",
+		JWTClaims: map[string]interface{}{
+			"sub":                  "did:key:zAlice",
+			"verifiableCredential": map[string]interface{}{"issuer": testConsumerDID},
+		},
 	})
 
 	resp := newMockResponse(id, []byte(`{"id":"urn:ngsi-ld:PersonalProfile:bob"}`))

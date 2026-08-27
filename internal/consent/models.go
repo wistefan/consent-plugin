@@ -70,6 +70,19 @@ type ConsentRequest struct {
 	// Empty means owner-level (any granted consent counts).
 	DataResource string `json:"data_resource,omitempty"`
 
+	// Consumer identifies the participant the data is being released TO, as its
+	// self-description URL. It is REQUIRED: a consent is an agreement between a
+	// data subject and one named consumer for one named purpose, so a check that
+	// ignores it would let participant Y ride on a consent the subject granted to
+	// participant X. A check without a consumer is denied.
+	Consumer string `json:"consumer,omitempty"`
+
+	// Purpose, when set, further scopes the check to the processing purpose (or
+	// contract) the exchange is governed by: a granted consent counts only if it
+	// covers this purpose. Empty means the purpose is not known — the consumer
+	// match still applies.
+	Purpose string `json:"purpose,omitempty"`
+
 	// Claims contains the forwarded JWT claims as key-value pairs.
 	Claims map[string]interface{} `json:"claims,omitempty"`
 

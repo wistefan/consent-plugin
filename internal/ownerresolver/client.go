@@ -56,6 +56,11 @@ type Claim struct {
 	OwnerID      string   `json:"ownerId"`
 	Participant  string   `json:"participant,omitempty"`
 	DataResource string   `json:"dataResource,omitempty"`
+	// Purpose names the processing purpose (or contract) governing this claim,
+	// when the resolver could identify the contract from the parties. It scopes
+	// the consent match: a granted consent counts only if it covers this purpose.
+	// Empty means the purpose is unknown and only the consumer match applies.
+	Purpose string `json:"purpose,omitempty"`
 }
 
 // Result is the OwnerResolver response.

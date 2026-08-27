@@ -196,12 +196,8 @@ func newConsentManager(t *testing.T, wantSubject, userID string, statuses []stri
 	mux.HandleFunc("/v1/consents/participants/", func(w http.ResponseWriter, r *http.Request) {
 		assert.Equal(t, "Bearer itest-participant-token", r.Header.Get("Authorization"),
 			"consents lookup must carry the participant token")
-		consents := make([]map[string]string, 0, len(statuses))
-		for _, s := range statuses {
-			consents = append(consents, map[string]string{"status": s})
-		}
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{"consents": consents})
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"consents": consentsGrantedTo(statuses)})
 	})
 
 	mux.HandleFunc("/v1/participants", participantRegistryHandler)
@@ -214,14 +210,44 @@ func newConsentManager(t *testing.T, wantSubject, userID string, statuses []stri
 // itestConsumerDID is the consuming participant named in the access token.
 const itestConsumerDID = "did:key:zConsumer"
 
+// itestConsumerSD is the self-description URL the participant registry maps
+// itestConsumerDID to — the consumer every consent check is scoped to.
+const itestConsumerSD = "http://catalog/participants/consumer"
+
+// consentsGrantedTo builds consent records with the given statuses, each granted
+// to the consuming participant the tests act as.
+func consentsGrantedTo(statuses []string) []map[string]interface{} {
+	consents := make([]map[string]interface{}, 0, len(statuses))
+	for _, s := range statuses {
+		consents = append(consents, map[string]interface{}{
+			"status":   s,
+			"consumer": map[string]string{"selfDescriptionURL": itestConsumerSD},
+		})
+	}
+	return consents
+}
+
 // participantRegistryHandler serves the consent-manager's participant registry,
 // which translates the consumer DID from the token into the self-description URL
 // a contract names its parties by.
 func participantRegistryHandler(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode([]map[string]string{
-		{"did": itestConsumerDID, "selfDescriptionURL": "http://catalog/participants/consumer"},
+		{"did": itestConsumerDID, "selfDescriptionURL": itestConsumerSD},
 	})
+}
+
+// newFailingConsentManager returns a consent-manager whose CONSENT CHECK calls
+// answer with the given status code (used to exercise the fail policy). The
+// participant registry still answers, so the failure under test is the check
+// itself and not the preceding contract lookup.
+func newFailingConsentManager(status int) *httptest.Server {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/participants", participantRegistryHandler)
+	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(status)
+	})
+	return httptest.NewServer(mux)
 }
 
 // newOwnerResolver starts a mock OwnerResolver that reports the given data
@@ -394,9 +420,7 @@ func TestIntegration_CustomDenyResponse(t *testing.T) {
 // TestIntegration_ConsentManagerError_FailOpen verifies a consent-manager error
 // passes through when fail-open is set.
 func TestIntegration_ConsentManagerError_FailOpen(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusInternalServerError)
-	}))
+	srv := newFailingConsentManager(http.StatusInternalServerError)
 	defer srv.Close()
 
 	resolver := newOwnerResolver(t, "did:key:zAlice")
@@ -415,9 +439,7 @@ func TestIntegration_ConsentManagerError_FailOpen(t *testing.T) {
 // TestIntegration_ConsentManagerError_FailClosed verifies a consent-manager error
 // is denied when fail-closed.
 func TestIntegration_ConsentManagerError_FailClosed(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusServiceUnavailable)
-	}))
+	srv := newFailingConsentManager(http.StatusServiceUnavailable)
 	defer srv.Close()
 
 	resolver := newOwnerResolver(t, "did:key:zAlice")
@@ -530,12 +552,8 @@ func newConsentManagerTokenService(t *testing.T, wantSubject, userID, selfDescri
 
 	mux.HandleFunc("/v1/consents/participants/", func(w http.ResponseWriter, r *http.Request) {
 		assert.Equal(t, "Bearer itest-token", r.Header.Get("Authorization"))
-		consents := make([]map[string]string, 0, len(statuses))
-		for _, s := range statuses {
-			consents = append(consents, map[string]string{"status": s})
-		}
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{"consents": consents})
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"consents": consentsGrantedTo(statuses)})
 	})
 
 	mux.HandleFunc("/v1/participants", participantRegistryHandler)

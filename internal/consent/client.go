@@ -129,7 +129,8 @@ type ClientConfig struct {
 // /participants/me then yields the provider selfDescriptionURL. Tokens are cached
 // package-wide (keyed by the full credential identity, see cacheKey) and
 // refreshed on expiry or a 401. Access is allowed iff a returned consent is
-// "granted".
+// "granted" AND was granted to the consuming participant named in the request
+// (see hasGrantedConsent).
 type Client struct {
 	baseURL         string
 	host            string
@@ -240,11 +241,16 @@ func (c *Client) CheckConsent(ctx context.Context, req ConsentRequest) (*Consent
 	if req.Subject == "" {
 		return &ConsentResponse{Decision: DecisionDeny, Reason: "no subject in request"}, nil
 	}
+	// Without a named consumer the check degenerates into "does this subject have
+	// any consent at all?", which authorises the wrong agreement. Deny instead.
+	if req.Consumer == "" {
+		return &ConsentResponse{Decision: DecisionDeny, Reason: "no consuming participant identified"}, nil
+	}
 
-	resp, err := c.check(ctx, req.Subject, req.DataResource, false)
+	resp, err := c.check(ctx, req, false)
 	if errors.Is(err, errParticipantUnauthorized) && c.staticToken == "" {
 		// The cached token was rejected — refresh it and retry once.
-		resp, err = c.check(ctx, req.Subject, req.DataResource, true)
+		resp, err = c.check(ctx, req, true)
 	}
 	if errors.Is(err, errParticipantUnauthorized) {
 		// Still unauthorized (or a static token was rejected): surface a plain error.
@@ -254,15 +260,16 @@ func (c *Client) CheckConsent(ctx context.Context, req ConsentRequest) (*Consent
 }
 
 // check performs one full verification attempt. forceLogin refreshes a cached
-// client-credentials token before use. When dataResource is non-empty the check
-// is scoped: a granted consent counts only if it covers that resource.
-func (c *Client) check(ctx context.Context, subject, dataResource string, forceLogin bool) (*ConsentResponse, error) {
+// token before use. The check is scoped by req: a granted consent counts only if
+// it was granted to req.Consumer and, when set, covers req.DataResource and
+// req.Purpose.
+func (c *Client) check(ctx context.Context, req ConsentRequest, forceLogin bool) (*ConsentResponse, error) {
 	token, providerSD, err := c.credentials(ctx, forceLogin)
 	if err != nil {
 		return nil, err
 	}
 
-	userIdentifier, found, err := c.resolveUserIdentifier(ctx, subject, providerSD, token)
+	userIdentifier, found, err := c.resolveUserIdentifier(ctx, req.Subject, providerSD, token)
 	if err != nil {
 		return nil, err
 	}
@@ -270,17 +277,28 @@ func (c *Client) check(ctx context.Context, subject, dataResource string, forceL
 		return &ConsentResponse{Decision: DecisionDeny, Reason: "no user identifier for subject"}, nil
 	}
 
-	granted, err := c.hasGrantedConsent(ctx, token, userIdentifier, dataResource)
+	granted, err := c.hasGrantedConsent(ctx, token, userIdentifier, req)
 	if err != nil {
 		return nil, err
 	}
 	if granted {
 		return &ConsentResponse{Decision: DecisionAllow}, nil
 	}
-	if dataResource != "" {
-		return &ConsentResponse{Decision: DecisionDeny, Reason: "no granted consent for resource " + dataResource}, nil
+	return &ConsentResponse{Decision: DecisionDeny, Reason: noGrantedConsentReason(req)}, nil
+}
+
+// noGrantedConsentReason explains which scope the deny was decided at, so the
+// audit record distinguishes "this subject consented to someone else" from
+// "this subject did not consent to this resource".
+func noGrantedConsentReason(req ConsentRequest) string {
+	reason := "no granted consent for consumer " + req.Consumer
+	if req.Purpose != "" {
+		reason += " and purpose " + req.Purpose
 	}
-	return &ConsentResponse{Decision: DecisionDeny, Reason: "no granted consent"}, nil
+	if req.DataResource != "" {
+		reason += " covering resource " + req.DataResource
+	}
+	return reason
 }
 
 // credentials resolves the participant token and provider self-description,
@@ -619,24 +637,123 @@ func (c *Client) resolveUserIdentifier(ctx context.Context, subject, providerSD,
 }
 
 // participantConsentsResponse is the consent-manager response to call 2. The
-// ?receipt=true form returns the raw consents, each carrying its status and the
-// data resources it covers.
+// ?receipt=true form returns the raw consents, each carrying its status, the
+// consumer it was granted to, the purposes it covers and the data resources it
+// covers.
 type participantConsentsResponse struct {
-	Consents []struct {
-		Status string `json:"status"`
-		Data   []struct {
-			Resource string `json:"resource"`
-		} `json:"data"`
-	} `json:"consents"`
+	Consents []consentRecord `json:"consents"`
+}
+
+// consentRecord is the (subset of the) consent receipt the plugin decides on.
+type consentRecord struct {
+	Status string `json:"status"`
+	Data   []struct {
+		Resource string `json:"resource"`
+	} `json:"data"`
+	// Consumer / DataConsumer are the two field names the consent-manager has
+	// used for the participant the data is released to; either may be present.
+	Consumer     participantRef `json:"consumer"`
+	DataConsumer participantRef `json:"dataConsumer"`
+	Purposes     []struct {
+		ID      string `json:"_id"`
+		Purpose string `json:"purpose"`
+	} `json:"purposes"`
+}
+
+// participantRef is a participant named inside a consent record. The
+// consent-manager returns it either as a bare identifier string or as an
+// embedded object, so it decodes both shapes and matches on any of the
+// identifiers it carries.
+type participantRef struct {
+	ID                 string `json:"_id"`
+	DID                string `json:"did"`
+	SelfDescriptionURL string `json:"selfDescriptionURL"`
+	// literal holds the value when the field was a bare string rather than an object.
+	literal string
+}
+
+// UnmarshalJSON accepts either a bare identifier string or a participant object.
+func (p *participantRef) UnmarshalJSON(data []byte) error {
+	var literal string
+	if err := json.Unmarshal(data, &literal); err == nil {
+		p.literal = literal
+		return nil
+	}
+	// Alias avoids recursing into this method while decoding the object form.
+	type participantRefObject participantRef
+	var obj participantRefObject
+	if err := json.Unmarshal(data, &obj); err != nil {
+		return fmt.Errorf("consent client: failed to unmarshal participant reference: %w", err)
+	}
+	*p = participantRef(obj)
+	return nil
+}
+
+// matches reports whether this reference denotes the given participant identity
+// (a self-description URL, but a record may name the participant by its id or
+// DID instead). An empty reference matches nothing.
+func (p participantRef) matches(identity string) bool {
+	if identity == "" {
+		return false
+	}
+	for _, candidate := range []string{p.SelfDescriptionURL, p.ID, p.DID, p.literal} {
+		if candidate != "" && candidate == identity {
+			return true
+		}
+	}
+	return false
+}
+
+// grantedTo reports whether the consent was granted to the given consumer.
+func (r consentRecord) grantedTo(consumer string) bool {
+	return r.Consumer.matches(consumer) || r.DataConsumer.matches(consumer)
+}
+
+// coversPurpose reports whether the consent covers the given processing purpose.
+// An empty purpose means the caller could not determine one, so the purpose is
+// not part of the match.
+func (r consentRecord) coversPurpose(purpose string) bool {
+	if purpose == "" {
+		return true
+	}
+	for _, p := range r.Purposes {
+		if p.Purpose == purpose || p.ID == purpose {
+			return true
+		}
+	}
+	return false
+}
+
+// coversResource reports whether the consent covers the given data resource. An
+// empty resource means the check is owner-level and any resource qualifies.
+func (r consentRecord) coversResource(dataResource string) bool {
+	if dataResource == "" {
+		return true
+	}
+	for _, d := range r.Data {
+		if d.Resource == dataResource {
+			return true
+		}
+	}
+	return false
 }
 
 // hasGrantedConsent performs call 2: it lists the user identifier's consents as
-// seen by the participant and reports whether any granted consent authorizes
-// access. When dataResource is empty the check is owner-level (any granted
-// consent suffices); otherwise a granted consent counts only if it covers that
-// resource (dataResource ∈ consent.data[].resource). A 401 is returned as
-// errParticipantUnauthorized so the caller can refresh the token and retry.
-func (c *Client) hasGrantedConsent(ctx context.Context, token, userIdentifier, dataResource string) (bool, error) {
+// seen by the participant and reports whether any of them authorizes THIS
+// access. A consent qualifies only when all of the following hold:
+//
+//   - its status is "granted";
+//   - it was granted to req.Consumer — a consent names one consumer, and one
+//     granted to participant X is not authority for participant Y to read the
+//     same data;
+//   - it covers req.Purpose, when the caller could determine one;
+//   - it covers req.DataResource, when the check is resource-scoped.
+//
+// A record that names no consumer therefore never qualifies: the plugin cannot
+// tell whose agreement it is, and guessing would authorise a processing purpose
+// the subject never agreed to. A 401 is returned as errParticipantUnauthorized
+// so the caller can refresh the token and retry.
+func (c *Client) hasGrantedConsent(ctx context.Context, token, userIdentifier string, req ConsentRequest) (bool, error) {
 	endpoint := c.endpoint(fmt.Sprintf(participantConsentsPathFmt, url.PathEscape(userIdentifier))) + "?receipt=true"
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
@@ -659,17 +776,12 @@ func (c *Client) hasGrantedConsent(ctx context.Context, token, userIdentifier, d
 	if err := json.Unmarshal(body, &out); err != nil {
 		return false, fmt.Errorf("consent client: failed to unmarshal consents response: %w", err)
 	}
-	for _, consent := range out.Consents {
-		if consent.Status != grantedStatus {
+	for _, record := range out.Consents {
+		if record.Status != grantedStatus {
 			continue
 		}
-		if dataResource == "" {
+		if record.grantedTo(req.Consumer) && record.coversPurpose(req.Purpose) && record.coversResource(req.DataResource) {
 			return true, nil
-		}
-		for _, d := range consent.Data {
-			if d.Resource == dataResource {
-				return true, nil
-			}
 		}
 	}
 	return false, nil
