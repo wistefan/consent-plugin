@@ -109,13 +109,20 @@ func (h *mockHeader) View() http.Header     { return h.headers }
 
 // mockResponse implements pkgHTTP.Response for testing.
 type mockResponse struct {
-	id            uint32
-	statusCode    int
-	header        *mockHeader
-	body          []byte
-	readErr       error
+	id         uint32
+	statusCode int
+	header     *mockHeader
+	body       []byte
+	readErr    error
+	// headerReads counts Header() calls. The runner materialises its header map
+	// on the first one and then reports the response as modified, so an allowed
+	// response must not touch it.
+	headerReads   int
 	writtenBody   []byte
 	writtenStatus int
+	// suppressContentTypeVar makes Var() report no upstream Content-Type, to
+	// exercise the header fallback.
+	suppressContentTypeVar bool
 }
 
 // newMockResponse builds a JSON upstream response carrying body.
@@ -125,15 +132,24 @@ func newMockResponse(id uint32, body []byte) *mockResponse {
 	return &mockResponse{id: id, header: h, body: body}
 }
 
-func (r *mockResponse) ID() uint32             { return r.id }
-func (r *mockResponse) StatusCode() int        { return r.statusCode }
-func (r *mockResponse) Header() pkgHTTP.Header { return r.header }
+func (r *mockResponse) ID() uint32      { return r.id }
+func (r *mockResponse) StatusCode() int { return r.statusCode }
+func (r *mockResponse) Header() pkgHTTP.Header {
+	r.headerReads++
+	return r.header
+}
 
 // Var returns the Nginx request id ($request_id) derived from the mock's id so
 // correlationKey resolves to the same key the tests store under.
 func (r *mockResponse) Var(name string) ([]byte, error) {
-	if name == nginxRequestIDVar {
+	switch name {
+	case nginxRequestIDVar:
 		return []byte(testReqKey(r.id)), nil
+	case nginxUpstreamContentTypeVar:
+		if r.suppressContentTypeVar {
+			return nil, nil
+		}
+		return []byte(responseContentTypeJSON), nil
 	}
 	return nil, nil
 }
@@ -1101,4 +1117,51 @@ func TestClaimPathRoot(t *testing.T) {
 			assert.Equal(t, tt.want, claimPathRoot(tt.path))
 		})
 	}
+}
+
+// TestResponseFilter_AllowDoesNotTouchHeaders verifies an allowed response never
+// calls Header(). The runner materialises its header map on the first call and
+// then reports HasChange() == true, so merely reading the Content-Type sent
+// every gated response back to APISIX down the "this response was modified"
+// path with an empty header diff.
+func TestResponseFilter_AllowDoesNotTouchHeaders(t *testing.T) {
+	clearContextStore()
+	server := newConsentManager(t, "uid-1", []string{"granted"})
+	defer server.Close()
+	resolver := newOwnerResolver(t, ownedBy(testOwnerDID))
+	defer resolver.Close()
+
+	const id = uint32(230)
+	storeRequest(id)
+	resp := newMockResponse(id, []byte(`{"id":"x"}`))
+
+	(&ConsentFilter{}).ResponseFilter(newTestConfig(server.URL, resolver.URL+"/resolve"), resp)
+
+	assert.Equal(t, 0, resp.writtenStatus, "the response should have been allowed")
+	assert.Zero(t, resp.headerReads, "an allowed response must not materialise the header map")
+}
+
+// TestResponseContentType covers both sources: the Nginx variable, and the
+// header fallback for a deployment where the variable is unavailable.
+func TestResponseContentType(t *testing.T) {
+	t.Run("prefers the nginx variable", func(t *testing.T) {
+		resp := newMockResponse(240, nil)
+		assert.Equal(t, responseContentTypeJSON, responseContentType(resp))
+		assert.Zero(t, resp.headerReads, "the variable must be enough")
+	})
+
+	t.Run("falls back to the header", func(t *testing.T) {
+		resp := newMockResponse(241, nil)
+		resp.suppressContentTypeVar = true
+		resp.header.Set("Content-Type", "application/ld+json")
+		assert.Equal(t, "application/ld+json", responseContentType(resp))
+		assert.Positive(t, resp.headerReads)
+	})
+
+	t.Run("reports nothing when neither source has it", func(t *testing.T) {
+		resp := newMockResponse(242, nil)
+		resp.suppressContentTypeVar = true
+		resp.header.Del("Content-Type")
+		assert.Empty(t, responseContentType(resp))
+	})
 }

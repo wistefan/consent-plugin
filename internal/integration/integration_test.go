@@ -147,8 +147,11 @@ func (r *mockResponse) ID() uint32             { return r.id }
 func (r *mockResponse) StatusCode() int        { return http.StatusOK }
 func (r *mockResponse) Header() pkgHTTP.Header { return r.header }
 func (r *mockResponse) Var(name string) ([]byte, error) {
-	if name == "request_id" {
+	switch name {
+	case "request_id":
 		return []byte(integrationReqKey(r.id)), nil
+	case "upstream_http_content_type":
+		return []byte(responseContentTypeJSON), nil
 	}
 	return nil, nil
 }

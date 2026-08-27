@@ -56,6 +56,16 @@ const pluginName = "consent-filter"
 // the other.
 const nginxRequestIDVar = "request_id"
 
+// nginxUpstreamContentTypeVar is the Nginx variable ($upstream_http_content_type)
+// holding the Content-Type the upstream answered with.
+//
+// It is read in preference to Response.Header() because that method lazily
+// materialises the runner's header map, and the runner then reports
+// HasChange() == true for the response — so merely LOOKING at a header sent
+// every allowed response back to APISIX down the "this response was modified"
+// path, carrying an empty header diff. Reading a variable has no such effect.
+const nginxUpstreamContentTypeVar = "upstream_http_content_type"
+
 // varReader is the subset of the runner's Request/Response interfaces that
 // exposes Nginx variables. Both pkgHTTP.Request and pkgHTTP.Response satisfy it.
 type varReader interface {
@@ -150,6 +160,20 @@ func (c *ConsentFilter) RequestFilter(conf interface{}, w http.ResponseWriter, r
 	}
 
 	StoreRequestContext(key, reqCtx)
+}
+
+// responseContentType reports the Content-Type of the upstream response,
+// preferring the Nginx variable so an allowed response is not marked as
+// modified (see nginxUpstreamContentTypeVar). The header is only consulted when
+// the variable is unavailable, which is a degraded case rather than the norm.
+func responseContentType(w pkgHTTP.Response) string {
+	if value, err := w.Var(nginxUpstreamContentTypeVar); err == nil && len(value) > 0 {
+		return string(value)
+	}
+	if header := w.Header(); header != nil {
+		return header.Get("Content-Type")
+	}
+	return ""
 }
 
 // decisionAllow and decisionDeny are the audit-facing labels for the decision.
@@ -265,10 +289,7 @@ func (c *ConsentFilter) evaluateWithResolver(cfg *Config, w pkgHTTP.Response, ke
 		return failOutcome(cfg, failByPolicy, "read upstream body: "+err.Error(), key, nil)
 	}
 
-	contentType := ""
-	if h := w.Header(); h != nil {
-		contentType = h.Get("Content-Type")
-	}
+	contentType := responseContentType(w)
 
 	// Parties are for CONTRACT identification only - never for ownership. The
 	// token names the consumer by DID, while contracts name their parties by
