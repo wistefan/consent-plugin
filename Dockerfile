@@ -3,7 +3,7 @@
 # Stage 2: copy it into a minimal runtime image.
 
 # --- Build stage ---
-FROM golang:1.26-alpine AS builder
+FROM golang:1.27-alpine AS builder
 
 WORKDIR /build
 
