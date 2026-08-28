@@ -15,11 +15,17 @@ jobs:
         with:
           go-version-file: go.mod
 
+      # -coverpkg=./... attributes the integration package's coverage of the
+      # packages it exercises; without it those statements are discarded and the
+      # reported figure understates reality.
       - name: Run tests (race + coverage)
-        run: go test -race -coverprofile=coverage.out ./...
+        run: go test -race -coverpkg=./... -coverprofile=coverage.out ./...
 
       - name: Coverage summary
         run: go tool cover -func=coverage.out
+
+      - name: Enforce the coverage floor
+        run: make coverage-floor
 
       - uses: actions/upload-artifact@v4
         with:

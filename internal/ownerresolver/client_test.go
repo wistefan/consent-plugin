@@ -109,3 +109,110 @@ func TestResolve_Non2xxIsError(t *testing.T) {
 		t.Fatal("expected error on non-2xx resolver response")
 	}
 }
+
+// TestDescribeBody verifies the three body encodings stay distinguishable.
+//
+// A payload the plugin cannot parse used to be described exactly like no payload
+// at all, so the resolver judged ownership from the resource descriptor alone
+// and a malformed-but-personal response (a truncated write, a content-type
+// mismatch, an upstream answering XML on a route declared JSON) was released
+// without ever being inspected.
+func TestDescribeBody(t *testing.T) {
+	tests := []struct {
+		name            string
+		payload         []byte
+		contentType     string
+		wantEncoding    string
+		wantContent     string
+		wantContentType string
+		wantSize        int
+	}{
+		{
+			name:         "no payload",
+			payload:      nil,
+			wantEncoding: encodingNone,
+		},
+		{
+			name:         "empty payload is no payload",
+			payload:      []byte{},
+			wantEncoding: encodingNone,
+		},
+		{
+			name:         "valid JSON is carried verbatim",
+			payload:      []byte(`{"id":"urn:entity:1"}`),
+			contentType:  "application/json",
+			wantEncoding: encodingJSON,
+			wantContent:  `{"id":"urn:entity:1"}`,
+		},
+		{
+			name:            "unparseable payload is opaque, not absent",
+			payload:         []byte("<person><email>alice@example.org</email></person>"),
+			contentType:     "application/xml",
+			wantEncoding:    encodingOpaque,
+			wantContentType: "application/xml",
+			wantSize:        49,
+		},
+		{
+			name:            "truncated JSON is opaque, not absent",
+			payload:         []byte(`{"id":"urn:entity`),
+			contentType:     "application/json",
+			wantEncoding:    encodingOpaque,
+			wantContentType: "application/json",
+			wantSize:        17,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := describeBody(tt.payload, tt.contentType)
+			if got.Encoding != tt.wantEncoding {
+				t.Fatalf("encoding = %q, want %q", got.Encoding, tt.wantEncoding)
+			}
+			if string(got.Content) != tt.wantContent {
+				t.Errorf("content = %q, want %q", string(got.Content), tt.wantContent)
+			}
+			if got.ContentType != tt.wantContentType {
+				t.Errorf("contentType = %q, want %q", got.ContentType, tt.wantContentType)
+			}
+			if got.Size != tt.wantSize {
+				t.Errorf("size = %d, want %d", got.Size, tt.wantSize)
+			}
+		})
+	}
+}
+
+// TestResolve_SendsOpaqueBodyForUnparseablePayload verifies the distinction
+// survives onto the wire, so the resolver can act on it.
+func TestResolve_SendsOpaqueBodyForUnparseablePayload(t *testing.T) {
+	var gotReq resolveRequest
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(raw, &gotReq)
+		w.Header().Set("Content-Type", contentTypeJSON)
+		_, _ = w.Write([]byte(`{"consentRequired":true,"claims":[{"ownerId":"did:key:zOwner"}]}`))
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, DefaultTimeoutMs)
+	_, err := c.Resolve(context.Background(),
+		Resource{Service: "svc", Method: "GET", Path: "/p", ContentType: "application/xml"},
+		Parties{Consumer: testConsumer},
+		[]byte("<person/>"))
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+
+	if gotReq.Body == nil {
+		t.Fatal("no body descriptor was sent")
+	}
+	if gotReq.Body.Encoding != encodingOpaque {
+		t.Errorf("encoding = %q, want %q — an unreadable payload must not look like no payload",
+			gotReq.Body.Encoding, encodingOpaque)
+	}
+	if gotReq.Body.ContentType != "application/xml" {
+		t.Errorf("contentType = %q, want application/xml", gotReq.Body.ContentType)
+	}
+	if len(gotReq.Body.Content) != 0 {
+		t.Errorf("an opaque body must not carry content, got %q", string(gotReq.Body.Content))
+	}
+}

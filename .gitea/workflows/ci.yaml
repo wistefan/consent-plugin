@@ -30,7 +30,8 @@ jobs:
       - name: Install golangci-lint
         uses: golangci/golangci-lint-action@v6
         with:
-          version: v2.1.6
+          # Must match .github/workflows/style-guide.yml.
+          version: v2.13.1
           args: ./...
 
       - name: Run tests with coverage

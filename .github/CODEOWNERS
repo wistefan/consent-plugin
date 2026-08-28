@@ -1,0 +1,16 @@
+# Review is required on every change: this repository decides whether personal
+# data is released, so nothing here is too small to be looked at by someone else.
+*                       @wistefan
+
+# The decision path itself. A change here can turn the gate into a pass-through.
+/internal/plugin/       @wistefan
+/internal/consent/      @wistefan
+/internal/ownerresolver/ @wistefan
+
+# The audit trail, which is the evidence that the gate worked.
+/internal/audit/        @wistefan
+
+# Security policy, CI gates and the release path.
+/SECURITY.md            @wistefan
+/.github/               @wistefan
+/.gitea/                @wistefan

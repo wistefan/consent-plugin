@@ -20,7 +20,7 @@ concurrency:
 
 env:
   REGISTRY: quay.io
-  REPOSITORY: wi_stefan
+  REPOSITORY: seamware
   IMAGE_NAME: consent-plugin
 
 jobs:

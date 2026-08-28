@@ -1,0 +1,16 @@
+# Keep the build context small and stable. Without this, `COPY . .` pulls in
+# .git, so every commit changes the context digest and invalidates the build
+# cache even when no source file changed.
+.git
+.github
+.gitea
+.golangci.yml
+.dockerignore
+Dockerfile
+docker-compose.yaml
+dev
+hack
+coverage.out
+go-runner
+*.md
+LICENSE
