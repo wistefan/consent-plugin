@@ -40,7 +40,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
 
@@ -48,7 +48,7 @@ jobs:
       - name: Verify module checksums
         run: go mod verify
 
-      - uses: golang/govulncheck-action@v1.0.4
+      - uses: golang/govulncheck-action@v1.1.0
         id: govulncheck
         with:
           go-version-file: go.mod
@@ -67,7 +67,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
 
