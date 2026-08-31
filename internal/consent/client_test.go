@@ -53,9 +53,12 @@ type mockCM struct {
 	resourcesPerConsent [][]string // optional data[].resource per consent (index-aligned with statuses)
 	selfDescriptionURL  string     // /me result
 	consentConsumer     string     // consumer the returned consents name (defaults to testConsumerSD)
-	consentPurposes     []string   // optional purposes the returned consents cover
-	tokenStatus         int        // non-200 => the token service fails with this status
-	failFirstConsents   bool       // first consents call 401s, then succeeds
+	// consentUsesRecipients emits the REAL ?receipt=true shape: `dataConsumer` as a
+	// bare Mongo id plus `recipients: [<sd>]`, instead of an expanded `consumer`.
+	consentUsesRecipients bool
+	consentPurposes       []string // optional purposes the returned consents cover
+	tokenStatus           int      // non-200 => the token service fails with this status
+	failFirstConsents     bool     // first consents call 401s, then succeeds
 	// recording
 	tokenCalls, meCalls, searchCalls, consentsCalls int
 	lastConsentKey, lastSearchEmail, lastSearchSD   string
@@ -126,6 +129,7 @@ func newMockCM(t *testing.T, m *mockCM) *httptest.Server {
 		fail := m.failFirstConsents
 		sts := append([]string(nil), m.statuses...)
 		res := append([][]string(nil), m.resourcesPerConsent...)
+		useRecipients := m.consentUsesRecipients
 		consumer := m.consentConsumer
 		if consumer == "" {
 			consumer = testConsumerSD
@@ -142,7 +146,15 @@ func newMockCM(t *testing.T, m *mockCM) *httptest.Server {
 		for i, s := range sts {
 			consent := map[string]interface{}{"status": s}
 			if !omitConsumer {
-				consent["consumer"] = map[string]string{"selfDescriptionURL": consumer}
+				if useRecipients {
+					// The real ?receipt=true shape: the consumer appears as a bare
+					// Mongo id in dataConsumer, and only `recipients` carries the
+					// self-description URL the plugin can compare against.
+					consent["dataConsumer"] = "6a95131a0a7640f7f6dee2d2"
+					consent["recipients"] = []string{consumer}
+				} else {
+					consent["consumer"] = map[string]string{"selfDescriptionURL": consumer}
+				}
 			}
 			if len(purposes) > 0 {
 				ps := make([]map[string]string, 0, len(purposes))
@@ -308,6 +320,48 @@ func TestCheckConsent(t *testing.T) {
 
 // TestCheckConsent_ClientCredentials verifies the full client-credentials flow:
 // login for a token, derive the provider SD from /me, then run the two calls.
+// TestCheckConsent_ConsumerNamedOnlyInRecipients is the shape the consent-manager
+// actually returns from `?receipt=true`: the consumer appears as a bare Mongo id in
+// `dataConsumer`, and the self-description URL the plugin holds appears only in
+// `recipients`. Matching on consumer/dataConsumer alone denies a perfectly valid
+// consent - which is what made step 4 of the demo answer 403 with a granted consent
+// in place.
+func TestCheckConsent_ConsumerNamedOnlyInRecipients(t *testing.T) {
+	const providerSD = "http://consent-facade:8080/participants/org-1"
+	resetCredCache()
+	m := &mockCM{
+		userID: "uid-1", selfDescriptionURL: providerSD, statuses: []string{"granted"},
+		consentUsesRecipients: true,
+	}
+	srv := newMockCM(t, m)
+	c := NewClient(ClientConfig{BaseURL: srv.URL, ConsentKey: "ck", ParticipantToken: "static", ProviderSD: providerSD})
+
+	resp, err := c.CheckConsent(context.Background(),
+		ConsentRequest{Subject: "alice-42", Consumer: testConsumerSD})
+	require.NoError(t, err)
+	assert.Equal(t, DecisionAllow, resp.Decision,
+		"a consent whose consumer is named in recipients must be honoured")
+}
+
+// TestCheckConsent_RecipientsNameADifferentConsumer guards the other direction: the
+// recipients fallback must not authorise a participant the consent was not granted to.
+func TestCheckConsent_RecipientsNameADifferentConsumer(t *testing.T) {
+	const providerSD = "http://consent-facade:8080/participants/org-1"
+	resetCredCache()
+	m := &mockCM{
+		userID: "uid-1", selfDescriptionURL: providerSD, statuses: []string{"granted"},
+		consentUsesRecipients: true, consentConsumer: "http://consent-facade:8080/participants/someone-else",
+	}
+	srv := newMockCM(t, m)
+	c := NewClient(ClientConfig{BaseURL: srv.URL, ConsentKey: "ck", ParticipantToken: "static", ProviderSD: providerSD})
+
+	resp, err := c.CheckConsent(context.Background(),
+		ConsentRequest{Subject: "alice-42", Consumer: testConsumerSD})
+	require.NoError(t, err)
+	assert.Equal(t, DecisionDeny, resp.Decision,
+		"a consent granted to another participant is not authority for this one")
+}
+
 func TestCheckConsent_TokenService(t *testing.T) {
 	resetCredCache()
 	m := &mockCM{userID: "uid-1", statuses: []string{"granted"}, selfDescriptionURL: "http://facade/participants/derived"}
