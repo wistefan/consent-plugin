@@ -762,7 +762,12 @@ type consentRecord struct {
 	// used for the participant the data is released to; either may be present.
 	Consumer     participantRef `json:"consumer"`
 	DataConsumer participantRef `json:"dataConsumer"`
-	Purposes     []struct {
+	// Recipients names the parties the data is released to, by self-description
+	// URL. It is the only place the consumer appears in a form the plugin can
+	// compare: on the `?receipt=true` records, `dataConsumer` is a bare Mongo id,
+	// which matches nothing the plugin holds.
+	Recipients []string `json:"recipients"`
+	Purposes   []struct {
 		ID      string `json:"_id"`
 		Purpose string `json:"purpose"`
 	} `json:"purposes"`
@@ -813,8 +818,21 @@ func (p participantRef) matches(identity string) bool {
 }
 
 // grantedTo reports whether the consent was granted to the given consumer.
+//
+// The consumer arrives as a self-description URL (mapped from the presented
+// credential's DID). On a `?receipt=true` record the consent-manager names the
+// consumer only as an internal id in `dataConsumer`, so the SD comparison has to
+// fall back to `recipients`.
+//
+// Only the FIRST recipient counts, because that is exactly how the authority
+// itself reads the field: the consent-manager resolves the data consumer as
+// `recipients[0]` (consentsController). Matching any recipient would authorise a
+// party the authority would not treat as the consumer.
 func (r consentRecord) grantedTo(consumer string) bool {
-	return r.Consumer.matches(consumer) || r.DataConsumer.matches(consumer)
+	if r.Consumer.matches(consumer) || r.DataConsumer.matches(consumer) {
+		return true
+	}
+	return len(r.Recipients) > 0 && r.Recipients[0] != "" && r.Recipients[0] == consumer
 }
 
 // coversPurpose reports whether the consent covers the given processing purpose.
